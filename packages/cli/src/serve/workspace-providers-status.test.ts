@@ -1414,6 +1414,25 @@ describe('createWorkspaceProvidersStatusProvider', () => {
     );
   });
 
+  it('strips multi-run userinfo credentials from a warning URL', async () => {
+    coreMock.throwModelsConfigError = true;
+    coreMock.modelsConfigErrorMessage =
+      'Failed loading provider https://user:my secret token@broken.example/v1';
+    const provider = createWorkspaceProvidersStatusProvider({ env: {} });
+    await writeUserSettings({
+      security: { auth: { selectedType: 'openai' } },
+      modelProviders: {
+        openai: [{ id: 'model-a', name: 'Model A' }],
+      },
+    });
+
+    const result = await provider(workspace, true);
+
+    expect(result.errors?.[0]?.error).toBe(
+      'Failed loading provider https://broken.example/v1',
+    );
+  });
+
   it('sanitizes credentials from provider construction errors', async () => {
     coreMock.throwModelsConfigError = true;
     coreMock.modelsConfigErrorMessage =

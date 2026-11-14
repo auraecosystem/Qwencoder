@@ -223,9 +223,24 @@ export function sanitizeProviderBaseUrl(baseUrl: string): string {
   try {
     const parsed = new URL(baseUrl);
     if (parsed.username || parsed.password) {
-      return authorityAtIndex >= authorityStart
-        ? stripAt(authorityAtIndex)
-        : baseUrl;
+      if (authorityAtIndex >= authorityStart) {
+        return stripAt(authorityAtIndex);
+      }
+      // The whitespace bound can cut the authority before the userinfo `@`
+      // when the userinfo holds more than one whitespace run ("user:my
+      // secret token@api.example"). The parser still reports credentials, so
+      // strip at the `@` the parser used instead of failing open — but only
+      // when userinfo-colon evidence precedes that `@`, which keeps prose
+      // like "… — contact admin@example.com" (whose `@` the parser also
+      // reads as userinfo) byte-identical.
+      const parserAt = findParserUserinfoAt(baseUrl, authorityStart);
+      if (
+        parserAt >= authorityStart &&
+        hasUserinfoColonEvidence(baseUrl, authorityStart, parserAt)
+      ) {
+        return stripAt(parserAt);
+      }
+      return baseUrl;
     }
     return baseUrl;
   } catch {
@@ -259,6 +274,50 @@ function findUnescapedUserInfoFallbackAt(
 
   const portCandidate = baseUrl.slice(colon + 1, authorityEnd);
   return /^\d+$/.test(portCandidate) ? -1 : at;
+}
+
+/**
+ * The `@` the URL parser treated as the userinfo delimiter: the last one
+ * inside the authority segment, which ends at the first `/`, `?` or `#`.
+ * Returns -1 when the segment holds no `@`.
+ */
+function findParserUserinfoAt(baseUrl: string, authorityStart: number): number {
+  let segEnd = baseUrl.length;
+  for (const ch of ['/', '?', '#']) {
+    const i = baseUrl.indexOf(ch, authorityStart);
+    if (i !== -1 && i < segEnd) {
+      segEnd = i;
+    }
+  }
+  return baseUrl.lastIndexOf('@', segEnd - 1);
+}
+
+/**
+ * Whether the parser's userinfo `@` is preceded by userinfo-colon evidence: a
+ * colon between the authority start and the first authority whitespace whose
+ * following run (up to the next whitespace or `@`) is neither empty nor all
+ * digits. That is what distinguishes pasted credentials ("user:my secret
+ * token@api.example") from prose whose `@` the parser also reads as userinfo
+ * — "api.example:8443 — contact admin@example.com" carries only a port colon,
+ * and in "host.io: contact admin@example.com" the colon is punctuation.
+ */
+function hasUserinfoColonEvidence(
+  baseUrl: string,
+  authorityStart: number,
+  at: number,
+): boolean {
+  const wsRel = baseUrl.slice(authorityStart).search(/\s/);
+  if (wsRel === -1) {
+    return false;
+  }
+  const wsIndex = authorityStart + wsRel;
+  const colon = baseUrl.lastIndexOf(':', wsIndex - 1);
+  if (colon < authorityStart) {
+    return false;
+  }
+  const run = baseUrl.slice(colon + 1, at).search(/[\s@]/);
+  const text = baseUrl.slice(colon + 1, run === -1 ? at : colon + 1 + run);
+  return text.length > 0 && !/^\d+$/.test(text);
 }
 
 function findAuthorityEnd(baseUrl: string, authorityStart: number): number {

@@ -396,6 +396,8 @@ describe('acpModelUtils', () => {
     ['https://user :pass@host.io/v1', 'https://host.io/v1'],
     ['https:// user:pass@host.io/v1', 'https://host.io/v1'],
     ['https://user:p@ss word@host.io/v1', 'https://host.io/v1'],
+    ['https://user:my secret token@api.example/v1', 'https://api.example/v1'],
+    ['https://user:my pass word@host.io/v1', 'https://host.io/v1'],
     [
       'https://api.example:8443 — contact admin@example.com',
       'https://api.example:8443 — contact admin@example.com',
