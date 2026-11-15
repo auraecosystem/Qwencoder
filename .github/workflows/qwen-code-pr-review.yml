@@ -1252,6 +1252,16 @@ jobs:
           # through Agent 7's own build-test (issue #10108). Opt-in here only;
           # rationale, budget and fail-open contract: cli lib/prebuild.ts.
           QWEN_REVIEW_PREBUILD: '1'
+          # Opt CI into the #9556 execution sandbox for the PR's own
+          # install/build/test: off, they inherit this step's GH_TOKEN +
+          # OPENAI_API_KEY. `required` refuses unsandboxed execution (evidence
+          # unavailable, review continues) — but a contained command that fails
+          # (no git in the mount, toolchain gaps, egress) is a PR-attributed
+          # failure, not "unavailable", and a refused prebuild leaves the tree
+          # bare for every agent (#10108). Does NOT contain the agent's own shell
+          # probes, so #9556 stays open. Mechanism: cli lib/sandboxed-exec.ts.
+          # DRAFT: canary-gated (PR #17282); delete this line once it passes.
+          QWEN_REVIEW_SANDBOX: 'required'
           TMPDIR: '${{ steps.review_scratch.outputs.dir }}'
         run: |-
           set -euo pipefail
