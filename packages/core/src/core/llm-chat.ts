@@ -738,6 +738,12 @@ export interface LlmChatSendOptions {
   preparedRequest?: LlmPreparedRequest;
   /** Skip only the configured model fallback chain for this request. */
   disableModelFallbacks?: boolean;
+  /**
+   * This send is an explicit user Retry. The model-availability ledger treats
+   * it as a turn boundary so a retry re-probes fallbacks the failed attempt
+   * consumed, instead of inheriting their skipped state.
+   */
+  isExplicitRetry?: boolean;
   /** Internal identity for the user prompt added to model history. */
   promptId?: string;
   /**
@@ -5831,6 +5837,23 @@ export class LlmChat {
               let currentResolvedModel = cgConfig?.model ?? model;
               let fallbackStreamYieldedAnyChunk = false;
 
+              // Model health ledger (experimental, opt-in): fallback models
+              // exhausted on a capacity error are skipped for the rest of this
+              // turn and re-probed once on the next turn. The primary is still
+              // attempted each request (it may have recovered); only fallback
+              // selection consults the ledger. An explicit Retry is a turn
+              // boundary so it re-probes fallbacks the failed attempt consumed.
+              const availability =
+                self.config.isModelAvailabilityTrackingEnabled?.()
+                  ? self.config.getModelAvailabilityService()
+                  : undefined;
+              if (availability) {
+                availability.beginTurn(prompt_id);
+                if (options?.isExplicitRetry) {
+                  availability.resetTurn();
+                }
+              }
+
               for (const fallbackModelId of fallbackModels) {
                 // Skip fallback models that match the current/primary model
                 if (
@@ -5882,6 +5905,18 @@ export class LlmChat {
                     `[FALLBACK] Skipping fallback model "${fallbackModelId}": ` +
                       `resolved model "${resolvedFallbackModel}" matches ` +
                       `the current model.`,
+                  );
+                  continue;
+                }
+
+                // Skip a fallback the health ledger already exhausted this turn.
+                if (
+                  availability &&
+                  !availability.snapshot(resolvedFallbackModel).available
+                ) {
+                  debugLogger.warn(
+                    `[FALLBACK] Skipping fallback model "${fallbackModelId}": ` +
+                      `marked unavailable for this turn.`,
                   );
                   continue;
                 }
@@ -5962,6 +5997,7 @@ export class LlmChat {
                   // Fallback succeeded
                   lastError = null;
                   fallbackSucceeded = true;
+                  availability?.markHealthy(resolvedFallbackModel);
                   debugLogger.info(
                     `[FALLBACK] Successfully completed request with ` +
                       `fallback model "${resolvedFallbackModel}".`,
@@ -6002,6 +6038,10 @@ export class LlmChat {
                   const canTryNextFallback = isFallbackEligible(
                     fallbackClassification,
                   );
+                  if (availability && canTryNextFallback) {
+                    availability.markRetryOncePerTurn(resolvedFallbackModel);
+                    availability.consumeStickyAttempt(resolvedFallbackModel);
+                  }
                   debugLogger.warn(
                     `[FALLBACK] Fallback model "${resolvedFallbackModel}" also ` +
                       `failed (reason: ${fallbackClassification.reason}, ` +
