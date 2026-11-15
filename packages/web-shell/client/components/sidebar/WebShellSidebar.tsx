@@ -3085,6 +3085,11 @@ export function WebShellSidebar({
     primaryWorkspaceExpansionId,
   ]);
 
+  // Auto-restore for a cold draft: expand the sidebar, but never write the
+  // connected workspace into the selection — a selection write re-enters
+  // this effect's trigger condition when the composer picker picks the
+  // primary workspace (spelled `undefined`), silently reverting the user's
+  // first pick (#16992).
   useEffect(() => {
     if (currentSessionId || selectedWorkspaceCwd !== undefined) {
       return;
@@ -3106,7 +3111,6 @@ export function WebShellSidebar({
           key: contextKey,
         });
       }
-      onSelectWorkspace?.(connectedWorkspace.cwd);
       return;
     }
     if (!hasWorkspaceExpansionPreference(primaryWorkspaceExpansionId)) {
@@ -3115,7 +3119,6 @@ export function WebShellSidebar({
   }, [
     connection.workspaceCwd,
     currentSessionId,
-    onSelectWorkspace,
     primaryWorkspaceExpansionId,
     selectedWorkspaceCwd,
     workspace.capabilities,
@@ -3560,7 +3563,14 @@ export function WebShellSidebar({
   const reconcileRemovedWorkspace = useCallback(
     async (removed: DaemonWorkspaceCapability) => {
       if (!sidebarMountedRef.current) return;
-      if (selectedWorkspaceCwd === removed.cwd) {
+      // A cold draft never writes the selection (the #16992 fix), so a
+      // removed workspace it is pointed at is only visible through the
+      // connection state; reset the draft to the primary so the next
+      // prompt does not target the removed cwd.
+      if (
+        selectedWorkspaceCwd === removed.cwd ||
+        (!connection.sessionId && connection.workspaceCwd === removed.cwd)
+      ) {
         onSelectWorkspace?.(undefined);
       }
       sessionCatalogController.invalidateWorkspace(removed.cwd);
@@ -3575,6 +3585,7 @@ export function WebShellSidebar({
       void reloadArchived().catch(() => undefined);
     },
     [
+      connection,
       onSelectWorkspace,
       reload,
       reloadArchived,
