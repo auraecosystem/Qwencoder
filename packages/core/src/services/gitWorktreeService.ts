@@ -14,13 +14,14 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 import type { SimpleGit } from 'simple-git';
+import ignore from 'ignore';
 import { Storage } from '../config/storage.js';
 import { isCommandAvailable } from '../utils/shell-utils.js';
 import { isNodeError } from '../utils/errors.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
 import { fileExists, isWithinRoot } from '../utils/fileUtils.js';
 import { NO_EXEC_CONFIG } from '../utils/gitUtils.js';
-import { runGitCapture } from '../utils/git-branches.js';
+import { runGitCapture, streamGitRecords } from '../utils/git-branches.js';
 import { loadSimpleGit } from '../utils/load-simple-git.js';
 import { gitEnv, gitRemoteEnv } from '../utils/git-branches.js';
 import { initRepositoryWithMainBranch } from './gitInit.js';
@@ -45,6 +46,22 @@ export function worktreeBranchForSlug(slug: string): string {
  */
 export const WORKTREE_SESSION_FILE = '.qwen-session';
 const WORKTREE_SESSION_MARKER_MAX_BYTES = 512;
+
+/**
+ * Filename of the optional, committed list of gitignored paths that are
+ * copied into every server-mode worktree created for the repository.
+ */
+export const WORKTREE_INCLUDE_FILE = '.worktreeinclude';
+
+/**
+ * Caps on the committed `.worktreeinclude`. The file is lower-trust input
+ * than a user's own settings (anyone who can push to the repository can
+ * change it), and every pattern costs time against every ignored file, so
+ * an uncapped file would let a repository slow every worktree creation.
+ * Both limits are generous next to any legitimate file.
+ */
+const WORKTREE_INCLUDE_MAX_BYTES = 1024 * 1024;
+const WORKTREE_INCLUDE_MAX_PATTERNS = 10_000;
 
 export class WorktreeSessionMarkerOwnerChangedError extends Error {
   constructor() {
@@ -183,6 +200,70 @@ function isDisposableIgnoredEntry(entry: string): boolean {
     entry.endsWith('/') &&
     DISPOSABLE_IGNORED_ROOTS.has(segments[segments.length - 1] ?? '')
   );
+}
+
+/**
+ * Parses the content of a `.worktreeinclude` file into gitignore patterns.
+ *
+ * The rules mirror git's own `.gitignore` parsing so the file can be
+ * authored by copying lines out of a `.gitignore`: a trailing CR is
+ * stripped, a line whose first character is `#` is a comment, and blank
+ * lines are skipped. Anything else is passed through untouched — leading
+ * whitespace is part of the pattern, and trailing whitespace is only
+ * stripped when it is not backslash-escaped, both of which the `ignore`
+ * package already implements.
+ */
+export function parseWorktreeInclude(content: string): string[] {
+  return content
+    .split('\n')
+    .map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line))
+    .filter((line) => line.trim() !== '' && !line.startsWith('#'));
+}
+
+/**
+ * Lists the files at `cwd` that git ignores, one repository-relative path
+ * per line.
+ *
+ * Recursive on purpose: without `--directory`, git walks into
+ * fully-ignored directories and reports the files inside them, so a single
+ * call yields a matchable set for any pattern. Adding `--directory` would
+ * collapse such a directory into one `dir/` entry and hide its contents.
+ * `-z` keeps paths verbatim (no quoting of non-ASCII bytes, and a path
+ * containing `\n` cannot split into two entries); `core.quotepath=false`
+ * is still set so the output is readable when a caller logs it.
+ *
+ * Streamed, not buffered: the listing is the size of everything git ignores,
+ * and a repository with two `node_modules`, a `.venv` or a build cache crosses
+ * `runGitCapture`'s 10 MB cap. That cap makes the call reject, so a caller
+ * reading the throw as "nothing ignored" silently copies nothing at all.
+ */
+export async function listIgnoredFiles(cwd: string): Promise<string[]> {
+  const paths: string[] = [];
+  await streamGitRecords(
+    cwd,
+    [
+      // `ls-files` can refresh the index, which runs a repository-configured
+      // `core.fsmonitor` program — from a tree obtained as files, that is
+      // arbitrary code on every worktree creation.
+      ...NO_EXEC_CONFIG,
+      '-c',
+      'core.quotepath=false',
+      'ls-files',
+      '--others',
+      '--ignored',
+      '--exclude-standard',
+      '-z',
+    ],
+    (record) => {
+      const name = record.toString('utf8');
+      // A path that does not survive decoding names some other file.
+      if (name && Buffer.from(name, 'utf8').equals(record)) {
+        paths.push(name);
+      }
+      return false;
+    },
+  );
+  return paths;
 }
 
 /**
@@ -1472,6 +1553,11 @@ export class GitWorktreeService {
       // Non-fatal: proceed without untracked files
     }
 
+    // Discover the gitignored paths named by a committed `.worktreeinclude`
+    // file. Those are exactly the files git will not carry into the new
+    // worktree, so they are the only ones worth copying on top.
+    const includedPaths = await this.resolveWorktreeIncludePaths();
+
     // Create worktrees for each entry
     for (const name of config.worktreeNames) {
       const createResult = await this.createWorktree(
@@ -1536,7 +1622,14 @@ export class GitWorktreeService {
           }
         }
 
-        // 3. Create a baseline commit capturing the full starting state
+        // 3. Copy the gitignored paths listed in `.worktreeinclude`
+        await this.copyWorktreeIncludePaths(
+          worktree.path,
+          includedPaths.paths,
+          includedPaths.root,
+        );
+
+        // 4. Create a baseline commit capturing the full starting state
         //    (committed + dirty + untracked). This allows us to later diff
         //    only the agent's changes, excluding the pre-existing dirty state.
         try {
@@ -2531,6 +2624,12 @@ export class GitWorktreeService {
         });
       }
 
+      // Phase D-4: copy the gitignored paths the repository's
+      // `.worktreeinclude` names (e.g. `.env`). Same fail-open policy as
+      // hooksPath — a missing file or a failed copy leaves the worktree
+      // usable, just without those files.
+      await this.copyIncludedPathsFromRepo(worktreePath);
+
       const worktree: WorktreeInfo = {
         id: slug,
         name: slug,
@@ -2901,6 +3000,327 @@ export class GitWorktreeService {
             `symlinkConfiguredDirectories: failed to link ${destAbs} → ${realSource}: ${error}`,
           );
         }
+      }
+    }
+  }
+
+  /**
+   * Resolves the repository's `.worktreeinclude` file and copies everything
+   * it selects into a worktree created by `createUserWorktree`
+   * (`--worktree`, `enter_worktree`, agent isolation).
+   *
+   * `setupWorktrees` (Agent Arena) runs the same two steps from
+   * {@link resolveWorktreeIncludePaths} and {@link copyWorktreeIncludePaths}
+   * directly, because it copies for every worktree it creates from one
+   * resolved list.
+   */
+  private async copyIncludedPathsFromRepo(worktreePath: string): Promise<void> {
+    const includedPaths = await this.resolveWorktreeIncludePaths();
+    await this.copyWorktreeIncludePaths(
+      worktreePath,
+      includedPaths.paths,
+      includedPaths.root,
+    );
+  }
+
+  /**
+   * Resolves the repo's optional `.worktreeinclude` file into the concrete
+   * set of gitignored paths a new server-mode worktree should receive.
+   *
+   * `.worktreeinclude` is committed to the repository, one gitignore-style
+   * pattern per line (`#` starts a comment, blank lines are skipped). A
+   * checkout made by `git worktree add` contains only tracked files, so
+   * everything git deliberately ignores — `.env`, local dev configs,
+   * certificates — is missing from it. This file names the subset that
+   * should be copied in.
+   *
+   * The candidate set is `git ls-files --others --ignored --exclude-standard`
+   * rather than the patterns' own expansion: a pattern can only ever select
+   * a file git already ignores, which keeps tracked files (already present
+   * in the new worktree) and paths outside the repository unreachable by
+   * construction. That listing is recursive, so a pattern reaching into a
+   * fully-ignored directory selects the files inside it rather than the
+   * directory itself.
+   *
+   * Every failure here is non-fatal: a missing file, unreadable file, or a
+   * failing `ls-files` yields an empty set and the worktree is created
+   * without the copies.
+   */
+  private async resolveWorktreeIncludePaths(): Promise<{
+    paths: string[];
+    root: string;
+  }> {
+    // `.worktreeinclude` is a repository file, so it and the listing it filters
+    // are both anchored at the repository root — a service constructed from a
+    // monorepo subdirectory would otherwise miss the file entirely and list
+    // only that subdirectory's ignored files, at subdirectory-relative paths.
+    const repoRoot = (await this.getRepoTopLevel()) ?? this.sourceRepoPath;
+    const includePath = path.join(repoRoot, WORKTREE_INCLUDE_FILE);
+
+    let content: string;
+    try {
+      const stat = await fs.stat(includePath);
+      if (!stat.isFile()) {
+        return { paths: [], root: repoRoot };
+      }
+      if (stat.size > WORKTREE_INCLUDE_MAX_BYTES) {
+        debugLogger.warn(
+          `resolveWorktreeIncludePaths: ${includePath} is ${stat.size} bytes, ` +
+            `over the ${WORKTREE_INCLUDE_MAX_BYTES}-byte cap; ignoring it`,
+        );
+        return { paths: [], root: repoRoot };
+      }
+      content = await fs.readFile(includePath, 'utf8');
+    } catch (error) {
+      if (!(isNodeError(error) && error.code === 'ENOENT')) {
+        debugLogger.warn(
+          `resolveWorktreeIncludePaths: cannot read ${includePath}: ${error}`,
+        );
+      }
+      return { paths: [], root: repoRoot };
+    }
+
+    const patterns = parseWorktreeInclude(content);
+    if (patterns.length === 0) {
+      return { paths: [], root: repoRoot };
+    }
+    if (patterns.length > WORKTREE_INCLUDE_MAX_PATTERNS) {
+      debugLogger.warn(
+        `resolveWorktreeIncludePaths: ${includePath} has ${patterns.length} patterns, ` +
+          `over the ${WORKTREE_INCLUDE_MAX_PATTERNS}-pattern cap; ignoring it`,
+      );
+      return { paths: [], root: repoRoot };
+    }
+
+    let ignored: string[];
+    try {
+      ignored = await listIgnoredFiles(repoRoot);
+    } catch (error) {
+      debugLogger.warn(
+        `resolveWorktreeIncludePaths: cannot list ignored files: ${error}`,
+      );
+      return { paths: [], root: repoRoot };
+    }
+
+    // `ignore` compiles patterns lazily, and a pathological single line throws
+    // a SyntaxError out of `ignores()`. Nothing above caps one line — the byte
+    // and count caps bound the file, not a line — so this has to stay inside
+    // the non-fatal contract like every other failure here.
+    try {
+      // `ignore` defaults to case-insensitive matching while git follows
+      // `core.ignorecase` (off on Linux), so the default would select
+      // `secrets/ID.json` for a `secrets/id.json` line that git does not match.
+      const matcher = ignore({
+        ignorecase: await this.destinationFoldsCase(repoRoot),
+      });
+      matcher.add(patterns);
+      return {
+        paths: ignored
+          .filter(
+            (candidate) =>
+              !candidate.endsWith('/') && matcher.ignores(candidate),
+          )
+          .sort(),
+        root: repoRoot,
+      };
+    } catch (error) {
+      debugLogger.warn(
+        `resolveWorktreeIncludePaths: cannot apply ${includePath}: ${error}`,
+      );
+      return { paths: [], root: repoRoot };
+    }
+  }
+
+  /**
+   * Repo-root-relative paths tracked in `worktreePath`, or `null` when the
+   * listing is unavailable (git error, output over the capture cap). Callers
+   * must treat `null` as "skip the copy" — a guard that cannot see the
+   * destination must not wave entries through.
+   */
+  private async listTrackedPaths(
+    worktreePath: string,
+  ): Promise<Set<string> | null> {
+    try {
+      const { stdout } = await runGitCapture(worktreePath, [
+        ...NO_EXEC_CONFIG,
+        'ls-files',
+        '-z',
+      ]);
+      return new Set(stdout.split('\0').filter(Boolean));
+    } catch (error) {
+      debugLogger.warn(
+        `copyWorktreeIncludePaths: cannot list tracked paths in ${worktreePath}: ${error}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Subset of `relPaths` that git's ignore rules exclude in `worktreePath`
+   * (rule-based: the paths need not exist on disk), or `null` when the check
+   * cannot be completed. Unlike {@link listTrackedPaths} this is bounded by
+   * the caller's pattern cap, but `git check-ignore` exits 1 when nothing
+   * matches, which `runGitCapture` reports as a rejection.
+   */
+  private async listIgnoredPaths(
+    worktreePath: string,
+    relPaths: readonly string[],
+  ): Promise<Set<string> | null> {
+    const ignored = new Set<string>();
+    const chunkSize = 50;
+    for (let i = 0; i < relPaths.length; i += chunkSize) {
+      const chunk = relPaths.slice(i, i + chunkSize);
+      try {
+        const { stdout } = await runGitCapture(worktreePath, [
+          ...NO_EXEC_CONFIG,
+          '-c',
+          'core.quotepath=false',
+          'check-ignore',
+          '--',
+          ...chunk,
+        ]).catch((error: { code?: number | string; stdout?: string }) => {
+          // Exit 1 means "no path in this chunk is ignored", not a failure.
+          if (error?.code === 1) {
+            return { stdout: error.stdout ?? '', stderr: '' };
+          }
+          throw error;
+        });
+        for (const line of stdout.split('\n')) {
+          const p = line.trimEnd();
+          if (p) {
+            ignored.add(p.split('\\').join('/'));
+          }
+        }
+      } catch (error) {
+        debugLogger.warn(
+          `copyWorktreeIncludePaths: cannot check ignore state in ${worktreePath}: ${error}`,
+        );
+        return null;
+      }
+    }
+    return ignored;
+  }
+
+  /**
+   * Whether the git repository at `repoPath` folds case when matching paths
+   * (`core.ignorecase`), or `false` when the setting cannot be read. Both
+   * path-matching steps have to agree with git: `.worktreeinclude` selection
+   * runs through `ignore`, whose default is case-insensitive, and the
+   * tracked-set comparison in {@link copyWorktreeIncludePaths} is byte-exact
+   * while `git check-ignore` folds — either mismatch copies a path git does
+   * not match, or lets a case-variant local file overwrite a tracked one on
+   * macOS or Windows.
+   */
+  private async destinationFoldsCase(repoPath: string): Promise<boolean> {
+    try {
+      const { stdout } = await runGitCapture(repoPath, [
+        ...NO_EXEC_CONFIG,
+        'config',
+        '--get',
+        'core.ignorecase',
+      ]);
+      return stdout.trim().toLowerCase() === 'true';
+    } catch (error) {
+      debugLogger.debug(
+        `cannot read core.ignorecase in ${repoPath}: ${error}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Copies the paths {@link resolveWorktreeIncludePaths} selected from the
+   * source repo into `worktreePath`, preserving directory structure.
+   *
+   * The destination is checked out from its own revision (`qwen
+   * --worktree=#<N>` uses the PR head), which may neither track nor ignore a
+   * path the source ignores. Deny by default: a path is copied only when the
+   * destination's ignore rules exclude it — there it stays out of `git add
+   * -A` — and skipped when it is tracked, when it is not ignored, or when a
+   * listing is unavailable. The guarded key comes from the resolved
+   * destination path so a committed directory symlink cannot bypass the
+   * check by a different lexical name. When the destination folds case the
+   * tracked set is compared folded too (Unicode composition folded with it),
+   * matching the ignore check's own case-insensitivity.
+   *
+   * Each entry is independent — one unreadable source does not stop the
+   * rest — and the step never fails the worktree creation.
+   */
+  private async copyWorktreeIncludePaths(
+    worktreePath: string,
+    relPaths: readonly string[],
+    sourceRoot = this.sourceRepoPath,
+  ): Promise<void> {
+    const tracked = await this.listTrackedPaths(worktreePath);
+    const ignored = await this.listIgnoredPaths(worktreePath, relPaths);
+    if (!tracked || !ignored) {
+      debugLogger.warn(
+        `copyWorktreeIncludePaths: destination state unavailable in ${worktreePath}; skipping the copy`,
+      );
+      return;
+    }
+    const foldsCase = await this.destinationFoldsCase(worktreePath);
+    const fold = (p: string) =>
+      foldsCase ? p.normalize('NFC').toLowerCase() : p;
+    const trackedFolded = new Set([...tracked].map(fold));
+    for (const relPath of relPaths) {
+      try {
+        const src = path.join(sourceRoot, relPath);
+        const dst = path.join(worktreePath, relPath);
+        // `ls-files --others --ignored` reports an ignored symlink as an
+        // ordinary entry and `copyFile` dereferences it, which would materialise
+        // content from outside the repo as a regular, agent-readable file.
+        const srcStat = await fs.lstat(src);
+        if (srcStat.isSymbolicLink()) {
+          debugLogger.warn(
+            `copyWorktreeIncludePaths: ${relPath} is a symlink; skipping it`,
+          );
+          continue;
+        }
+        // A committed directory symlink in the destination would make the
+        // mkdir/copy below write through it, outside the worktree — and the
+        // tracked/ignored sets are keyed by repo-relative path, so the guard
+        // has to look at the path as the copy actually lands, not the
+        // caller's lexical spelling.
+        const parent = path.dirname(dst);
+        const realParent = await fs.realpath(parent).catch(async () => {
+          await fs.mkdir(parent, { recursive: true });
+          return fs.realpath(parent);
+        });
+        const realRoot = await fs.realpath(worktreePath);
+        if (!isWithinRoot(realParent, realRoot)) {
+          debugLogger.warn(
+            `copyWorktreeIncludePaths: ${relPath} resolves outside ${worktreePath}; skipping it`,
+          );
+          continue;
+        }
+        const guardedRel = path
+          .relative(realRoot, path.join(realParent, path.basename(dst)))
+          .split(path.sep)
+          .join('/');
+        if (trackedFolded.has(fold(guardedRel))) {
+          debugLogger.warn(
+            `copyWorktreeIncludePaths: ${guardedRel} is tracked in ${worktreePath}; not overwriting it`,
+          );
+          continue;
+        }
+        // Untracked and not ignored would make the copy an ordinary
+        // untracked file: the very next `git add -A` (the setupWorktrees
+        // baseline runs one) would commit the user's local secret.
+        if (!ignored.has(guardedRel)) {
+          debugLogger.warn(
+            `copyWorktreeIncludePaths: ${guardedRel} is not ignored in ${worktreePath}; skipping it`,
+          );
+          continue;
+        }
+        await fs.copyFile(src, dst);
+        debugLogger.debug(
+          `copyWorktreeIncludePaths: copied ${relPath} into ${worktreePath}`,
+        );
+      } catch (error) {
+        debugLogger.warn(
+          `copyWorktreeIncludePaths: cannot copy ${relPath}: ${error}`,
+        );
       }
     }
   }
