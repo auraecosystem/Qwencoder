@@ -12,10 +12,29 @@ import {
   useState,
 } from 'react';
 import type { RefObject } from 'react';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { render } from 'ink-testing-library';
 import { act } from '@testing-library/react';
 import { Box, Text } from 'ink';
+
+// Captured before the component's module-level logger is created, so the
+// hold diagnostic is observable: while the hold is active the "viewport not
+// ready" line can never fire for this state.
+const { debugCalls } = vi.hoisted(() => ({
+  debugCalls: [] as unknown[][],
+}));
+vi.mock('@qwen-code/qwen-code-core/utils/debugLogger.js', () => ({
+  createDebugLogger: () => ({
+    isEnabled: () => false,
+    debug: (...args: unknown[]) => {
+      debugCalls.push(args);
+    },
+    info: () => undefined,
+    warn: () => undefined,
+    error: () => undefined,
+  }),
+}));
+
 import {
   VirtualizedList,
   type VirtualizedListRef,
@@ -1502,6 +1521,53 @@ describe('<VirtualizedList /> zero-height host measurement', () => {
     rerender(list(0));
     // The painted root follows the host's 0 regardless of the hold.
     expect(lastFrame() ?? '').not.toMatch(/item-\d+/);
+  });
+
+  it('logs the held viewport while the host reports 0', () => {
+    // While the hold is active `containerHeight` resolves to the held value,
+    // so the "viewport not ready" diagnostic is unreachable for this state.
+    // The hold line is the only `--debug` trace that greps for both the
+    // #5142 blank-transcript report and a held-rows overflow report, and it
+    // counts the frames the hold has persisted.
+    debugCalls.length = 0;
+    const list = (height: number) => (
+      <Box flexDirection="column">
+        <VirtualizedList<Item>
+          data={makeItems(20)}
+          renderItem={renderItem}
+          estimatedItemHeight={estimatedItemHeight}
+          keyExtractor={keyExtractor}
+          containerHeight={height}
+          showScrollbar={false}
+        />
+      </Box>
+    );
+
+    const { rerender } = render(list(10));
+    rerender(list(0));
+    rerender(list(0));
+
+    const held = debugCalls
+      .map((args) => String(args[0]))
+      .filter((message) => message.includes('viewport held at 10 rows'));
+    // The hold engaged on the first zero frame (streak 1); the same zero
+    // frame's subsequent render passes keep counting, so every line names
+    // the same held height and the streak only moves forward.
+    expect(held.length).toBeGreaterThan(0);
+    expect(held[0]).toContain('for 1 render');
+    expect(Number(held[held.length - 1]!.match(/for (\d+) render/)![1])).toBe(
+      held.length,
+    );
+
+    // A positive host height releases the hold and resets the streak, so a
+    // later hold reports the new held value from 1 again.
+    rerender(list(12));
+    rerender(list(0));
+    const heldAgain = debugCalls
+      .map((args) => String(args[0]))
+      .filter((message) => message.includes('viewport held at'));
+    expect(heldAgain.at(-1)).toContain('viewport held at 12 rows');
+    expect(heldAgain.at(-1)).toContain('for 1 render');
   });
 
   // A one-step positive → 0 shrink keeps the positive height held for the

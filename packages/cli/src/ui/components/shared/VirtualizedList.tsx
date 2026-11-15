@@ -265,8 +265,24 @@ function VirtualizedList<T>(
   // nothing to hold: keep the host's `0` so a fresh mount at zero stays
   // collapsed instead of falling through to the component's own measurement.
   const lastConstrainedHeight = useRef<number | undefined>(undefined);
+  const holdStreak = useRef(0);
   if (props.containerHeight !== undefined && props.containerHeight > 0) {
     lastConstrainedHeight.current = props.containerHeight;
+    holdStreak.current = 0;
+  } else if (
+    props.containerHeight !== undefined &&
+    props.containerHeight <= 0 &&
+    lastConstrainedHeight.current !== undefined
+  ) {
+    // While the hold is active `containerHeight` resolves to the held value,
+    // so the "viewport not ready" diagnostic can never fire for this state.
+    // Log the hold itself instead: with `--debug`, both the #5142
+    // blank-transcript report and a held-rows overflow report grep to this
+    // line, with the hold's age on every frame it persists.
+    holdStreak.current += 1;
+    debugLogger.debug(
+      `viewport held at ${lastConstrainedHeight.current} rows; host reported 0 for ${holdStreak.current} render(s)`,
+    );
   }
   const hostHeight =
     props.containerHeight === undefined
