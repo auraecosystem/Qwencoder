@@ -262,7 +262,7 @@ void memoryManager
 
 两个任务都不要 await。`MemoryManager` 已经跟踪这些工作。这两个 rejection 处理器是必需的，用于防止出现未处理的后台 rejection，而不是为了增加回退路径。
 
-`runManagedAutoSkillReview()` 入队的 skill 评审是唯一会经过 `LlmClient.pendingMemoryTaskPromises` 的例外：它由同一个 client 入队，ACP 分支在调度之后立即消费并 await 这个队列。留在队列里会让 promise 在长期运行的 `qwen serve` 进程里一直驻留，而 ACP 没有 TUI 的 `memory_saved` 条目来消费它。
+`runManagedAutoSkillReview()` 入队的 skill 评审同样会经过 `LlmClient.pendingMemoryTaskPromises`：它由同一个 client 入队。ACP 分支在调度之后立即取走这个队列，但不 await——与 Extract 和 Dream 一样，评审保持 fire-and-forget，没有 ACP 消费者读取其结果，await 它只会让 `session/prompt` 在后台 agent 上保持打开。取走仍然必要：留在队列里会让 promise 在长期运行的 `qwen serve` 进程里一直驻留。
 
 不新增 "once" 字段。调度代码恰好只有一个可达的调用点，位于结束全新逻辑轮次的那一次 `#handleStopHookLoop()` 之后。工具续发与 Stop hook 续发从不会独立经过这个调用点。
 

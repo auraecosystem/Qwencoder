@@ -389,12 +389,13 @@ Do not await either task. `MemoryManager` already tracks the work. The two
 rejection handlers are required to prevent unhandled background rejections, not
 to add a fallback path.
 
-The skill review queued by `runManagedAutoSkillReview()` is the one exception
-that does go through `LlmClient.pendingMemoryTaskPromises`: it is queued by the
-same client, so the ACP branch consumes and awaits that queue immediately after
-scheduling. Leaving it there would retain a promise for the life of a
-long-running `qwen serve` process, and ACP has no TUI `memory_saved` item to
-consume it.
+The skill review queued by `runManagedAutoSkillReview()` is the one task that
+goes through `LlmClient.pendingMemoryTaskPromises`: it is queued by the same
+client. The ACP branch drains that queue immediately after scheduling and does
+not await it — like Extract and Dream, the review is fire-and-forget, and no
+ACP consumer reads its result, so awaiting it would only hold `session/prompt`
+open on a background agent. Draining still matters: leaving the promises queued
+would retain them for the life of a long-running `qwen serve` process.
 
 There is no new "once" field. The scheduling code has exactly one reachable
 callsite, after the one `#handleStopHookLoop()` that terminates a fresh logical

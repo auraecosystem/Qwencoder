@@ -3442,24 +3442,18 @@ export class LlmClient {
    * tool calls. Split out of {@link runManagedAutoMemoryBackgroundTasks} so a
    * host that schedules the memory tasks itself — ACP's `Session`, which only
    * reaches Extract and Dream — can run the same gate. Must be called on the
-   * tool-call counters this client keeps, since it resets both.
+   * tool-call counters this client keeps, since it resets both. The review is
+   * fire-and-forget: the promise joins {@link pendingMemoryTaskPromises} for
+   * the host to drain, and no caller awaits it.
    */
-  /**
-   * Schedules the managed skill review and returns its promise, so a host that
-   * has to wait for the review can await exactly that and nothing else.
-   *
-   * Extract and Dream stay fire-and-forget by design (design doc §6): they are
-   * background agents that can run for minutes, so a host awaiting the whole
-   * pending-task queue would hold its turn open on them.
-   */
-  runManagedAutoSkillReview(): Promise<number> | undefined {
+  runManagedAutoSkillReview(): void {
     if (this.shutdownRequested) {
       debugLogger.debug('Skipping skill review: shutdown requested.');
-      return undefined;
+      return;
     }
     const autoSkillEnabled = this.config.getAutoSkillEnabled();
     if (!autoSkillEnabled) {
-      return undefined;
+      return;
     }
     const skillReviewResult = this.config
       .getMemoryManager()
@@ -3489,9 +3483,6 @@ export class LlmClient {
             return 0;
           });
         this.pendingMemoryTaskPromises.push(reviewPromise);
-        // Returned so a waiting host can await the review itself rather than
-        // the whole queue, which also carries Extract and Dream.
-        return reviewPromise;
       }
     } else if (
       skillReviewResult.status === 'skipped' &&
@@ -3509,7 +3500,6 @@ export class LlmClient {
     // the flag is set, scheduleSkillReview returns 'skipped' immediately
     // (never 'scheduled'), so without this reset the flag can never clear.
     this.skillsModifiedInSession = false;
-    return undefined;
   }
 
   /**
@@ -3520,43 +3510,42 @@ export class LlmClient {
   runManagedAutoMemoryBackgroundTasks(
     messageType: SendMessageType,
     { skipMemoryExtraction = false }: { skipMemoryExtraction?: boolean } = {},
-  ): Promise<number> | undefined {
+  ): void {
     // During shutdown, skip all background memory tasks so the process
     // can exit cleanly without spawning new work.
     if (this.shutdownRequested) {
       debugLogger.debug(
         'Skipping background memory tasks: shutdown requested.',
       );
-      return undefined;
+      return;
     }
 
     // autoSkill counts tool calls and can trigger on both UserQuery and
-    // ToolResult turns so the threshold can fire mid-session. The review
-    // promise is returned so a host can await exactly it without calling the
-    // gate a second time: scheduleSkillReview clears the flags it reads
+    // ToolResult turns so the threshold can fire mid-session. The gate runs
+    // inside this call so the review is scheduled in the same evaluation as
+    // Extract and Dream: scheduleSkillReview clears the flags it reads
     // (skillsModifiedInSession always), so a second evaluation would judge
     // the turn on state the first one reset and dispatch what the gates
     // already declined.
-    let skillReview: Promise<number> | undefined;
     if (
       messageType === SendMessageType.UserQuery ||
       messageType === SendMessageType.ToolResult
     ) {
-      skillReview = this.runManagedAutoSkillReview();
+      this.runManagedAutoSkillReview();
     }
 
     if (
       messageType !== SendMessageType.UserQuery &&
       messageType !== SendMessageType.ToolResult
     ) {
-      return skillReview;
+      return;
     }
 
     const projectRoot = this.config.getProjectRoot();
     const mgr = this.config.getMemoryManager();
 
     if (!this.config.getManagedAutoMemoryEnabled()) {
-      return skillReview;
+      return;
     }
 
     for (const scope of ['project', 'user'] as const) {
@@ -3577,19 +3566,19 @@ export class LlmClient {
     // Extract and Dream stay once per user query; migration also needs the
     // completed ToolResult path so tool-using turns can activate recall.
     if (messageType !== SendMessageType.UserQuery) {
-      return skillReview;
+      return;
     }
     // A session agent's hidden session is agent-to-agent work, not the
     // person's conversation: extracting from it would add a model call to
     // every agent turn and feed agent chatter into the person's memory.
     if (this.config.isSessionAgentSession?.() === true) {
-      return skillReview;
+      return;
     }
     // A relayed message is often not the person's own: extracting at its stop
     // would add model calls to every relayed event, learning from turns the
     // person did not take.
     if (skipMemoryExtraction) {
-      return skillReview;
+      return;
     }
 
     const sessionId = this.config.getSessionId();
@@ -3644,7 +3633,6 @@ export class LlmClient {
         return 0;
       });
     this.pendingMemoryTaskPromises.push(dreamPromise);
-    return skillReview;
   }
 
   /**

@@ -11720,8 +11720,8 @@ export class Session implements SessionContext {
     }
     const llmClient = this.config.getLlmClient();
     llmClient.captureCacheSafeParams();
-    // Capture the review promise from the same call that schedules the rest
-    // of the background work. Calling the gate separately first would make
+    // The gate runs inside the same call that schedules the rest of the
+    // background work. Calling it separately first would make
     // runManagedAutoMemoryBackgroundTasks evaluate it a second time on flags
     // the first call just reset (skillsModifiedInSession is always cleared),
     // dispatching a review the `skills_modified_in_session` gate declined.
