@@ -38,6 +38,95 @@ export const TABLE_SEPARATOR_RE =
   /^(?=.*\|)\s*\|?\s*(:?-+:?)\s*(\|\s*(:?-+:?)\s*)*\|?\s*$/;
 /** A fenced code block delimiter. Group 1 is the fence (``` or ~~~ run). */
 export const CODE_FENCE_RE = /^ *(`{3,}|~{3,}) *([^`]*)$/;
+/** A list item: indent (1), marker (2), then the item text (3). */
+export const LIST_ITEM_RE = /^([ \t]*)([-*+]|\d+\.) +(.*)$/;
+/** A blockquote line: `> text`. Group 1 is the quoted text. */
+export const BLOCKQUOTE_LINE_RE = /^ *> ?(.*)$/;
+
+// Mirrors MarkdownDisplay's own prefixes. They are re-declared rather than
+// imported because MarkdownDisplay imports this module.
+const LIST_ITEM_PREFIX_PADDING = 1;
+const BLOCKQUOTE_PREFIX_PADDING = 1;
+const BLOCKQUOTE_MARKER_WIDTH = 2; // "│ "
+export const CODE_BLOCK_PREFIX_PADDING = 1;
+const TASK_ITEM_GLYPH_WIDTH = 2; // `✓ ` / `○ `
+
+/** Rows the renderer reserves below the viewport when it pre-slices pending
+ *  or height-budgeted content (`availableTerminalHeight - 2`). Exported so the
+ *  height gate measures against the same budget the renderer slices at, not
+ *  the raw viewport. */
+export const PENDING_RENDERED_BUDGET_RESERVE = 2;
+
+/** Extra rows reserved when clamping a streaming table (`- 3`): marginY 2 +
+ *  one row of wrapped-cell safety headroom. */
+export const TABLE_PENDING_RESERVED_ROWS = 3;
+
+/** Floor of the renderer's pending budget (streaming safety net). */
+export const MIN_PENDING_CONTENT_LINES = 1;
+
+/** The budget MarkdownDisplay actually slices at for a viewport of
+ *  `availableTerminalHeight` rows. */
+export function pendingRenderedBudget(availableTerminalHeight: number): number {
+  return Math.max(
+    MIN_PENDING_CONTENT_LINES,
+    availableTerminalHeight - PENDING_RENDERED_BUDGET_RESERVE,
+  );
+}
+
+/** The clamp MarkdownDisplay applies to a streaming/budgeted table for a
+ *  viewport of `availableTerminalHeight` rows. */
+export function pendingTableClampRows(availableTerminalHeight: number): number {
+  return Math.max(2, availableTerminalHeight - TABLE_PENDING_RESERVED_ROWS);
+}
+
+/**
+ * True when `lines` opens a ```mermaid (or ~~~mermaid) fence. The renderer
+ * draws such a fence as a diagram whose height is bounded only by the
+ * message-level viewport — never by the fence's source lines — so no
+ * source-line charge models it. A completed-result gate fails closed on it
+ * (plain-text fallback, the behavior every budgeted result had before
+ * markdown was kept) rather than certify a fit the diagram can overflow.
+ */
+export function hasMermaidFence(lines: string[]): boolean {
+  let fence: string | null = null;
+  for (const line of lines) {
+    const match = CODE_FENCE_RE.exec(line);
+    if (fence) {
+      if (
+        match &&
+        match[1]!.startsWith(fence[0]!) &&
+        match[1]!.length >= fence.length
+      ) {
+        fence = null;
+      }
+      continue;
+    }
+    if (match) {
+      // The renderer takes the language from the first token of the info
+      // string, so a fence carrying anything after it — `mermaid title="x"`,
+      // `mermaid qwen-code:start-line=12` — still draws a diagram. Matching
+      // the whole string here would let that fence be charged by its source
+      // lines and then render a diagram past the budget the gate certified.
+      if (fenceLanguage(match[2]) === 'mermaid') return true;
+      fence = match[1]!;
+    }
+  }
+  return false;
+}
+
+const START_LINE_DIRECTIVE_RE = /\s*\bqwen-code:start-line=\d+\b/;
+
+/**
+ * The language a fence's info string names, resolved the way the renderer
+ * resolves it: the start-line directive stripped, then the first token.
+ */
+function fenceLanguage(info: string): string | null {
+  const token = info
+    .replace(START_LINE_DIRECTIVE_RE, '')
+    .trim()
+    .split(/\s+/)[0];
+  return token ? token.toLowerCase() : null;
+}
 
 function readTableInlineMathSpan(row: string, index: number): string | null {
   return readInlineMathSpanAt(row, index);
@@ -110,6 +199,44 @@ export function estimateWrappedRows(line: string, width: number): number {
 }
 
 /**
+ * How many rows a plain (non-table, non-code-fence) source line renders at
+ * `contentWidth`. List items and blockquotes share only part of that width:
+ * MarkdownDisplay insets the item text by its marker + padding, so charging the
+ * whole line at `contentWidth` under-counts a wide bullet by a row (#13956).
+ * Charges the narrowest width the line can render at, so the estimate stays an
+ * upper bound.
+ */
+export function estimateLineRows(line: string, contentWidth: number): number {
+  if (contentWidth <= 0) return 1;
+  const listItem = LIST_ITEM_RE.exec(line);
+  if (listItem) {
+    // RenderListItemInternal insets the text box by the item's indent, the
+    // shared prefix padding and a fixed-width marker cell, at every nesting
+    // level. A task item's literal `[ ] ` is never drawn — it becomes a
+    // 2-column glyph — so charging it would over-charge a fitting checklist
+    // by those columns.
+    const task = /^\[[ xX]\]\s+/.exec(listItem[3]!);
+    const itemText = task ? listItem[3]!.slice(task[0].length) : listItem[3]!;
+    const markerWidth = task
+      ? TASK_ITEM_GLYPH_WIDTH
+      : getCachedStringWidth(listItem[2]!) + 1;
+    const indentWidth = getCachedStringWidth(listItem[1]!);
+    return estimateWrappedRows(
+      itemText,
+      contentWidth - indentWidth - LIST_ITEM_PREFIX_PADDING - markerWidth,
+    );
+  }
+  const blockquote = BLOCKQUOTE_LINE_RE.exec(line);
+  if (blockquote) {
+    return estimateWrappedRows(
+      blockquote[1]!,
+      contentWidth - BLOCKQUOTE_PREFIX_PADDING - BLOCKQUOTE_MARKER_WIDTH,
+    );
+  }
+  return estimateWrappedRows(line, contentWidth);
+}
+
+/**
  * True when `lines[i]` starts a markdown table: a `| ... |` row immediately
  * followed by a separator row whose column count matches the header's. The
  * column-count check mirrors the renderer's own table detection so this and
@@ -138,6 +265,15 @@ export interface PendingSliceResult {
   keptLines: number;
   /** True when some trailing source lines were dropped to fit the budget. */
   clipped: boolean;
+  /**
+   * RENDERED rows (not source lines) walked through `keptLines`. Unlike
+   * `clipped`, this is true when the result does not fit `budget`, including
+   * the case where an over-budget leading table is kept whole (the `i > 0`
+   * cut rule) and `clipped` therefore stays false. Callers using this as a
+   * height gate must read it alongside `clipped` — a cut at a later block
+   * leaves `renderedRows` at the prefix while `clipped` is true.
+   */
+  renderedRows: number;
 }
 
 /**
@@ -163,24 +299,35 @@ export function fitPendingSlice(
   contentWidth: number,
   budget: number,
   tableClampRows: number,
+  options: { showLineNumbers?: boolean } = {},
 ): PendingSliceResult {
   let rendered = 0;
   let kept = allLines.length;
   let codeFence = ''; // non-empty while inside a fenced code block
+  // Width the active fence's body is charged at: RenderCodeBlock draws code
+  // inside `paddingLeft={CODE_BLOCK_PREFIX_PADDING}` and colorizeCode prefixes
+  // each line with a right-padded line number plus a space (`ui.showLineNumbers`
+  // defaults on), so the code text box is narrower than `contentWidth`. The
+  // gutter grows with the block's line count, so it is derived per block, not
+  // hard-coded.
+  let activeCodeLineWidth = contentWidth;
+  const showLineNumbers = options.showLineNumbers ?? true;
   for (let i = 0; i < allLines.length; ) {
     const line = allLines[i]!;
     const fenceMatch = CODE_FENCE_RE.exec(line);
     if (codeFence) {
-      // Inside a code block: charge the line as code (one row, wrapped), and
-      // close on a matching fence. Never treat contents as a table.
+      // Inside a code block: charge the line as code at the code box's width
+      // (a code line renders verbatim — no markdown constructs), and close on
+      // a matching fence. Never treat contents as a table.
       if (
         fenceMatch &&
         fenceMatch[1]!.startsWith(codeFence[0]!) &&
         fenceMatch[1]!.length >= codeFence.length
       ) {
         codeFence = '';
+        activeCodeLineWidth = contentWidth;
       }
-      rendered += estimateWrappedRows(line, contentWidth);
+      rendered += estimateWrappedRows(line, activeCodeLineWidth);
       if (rendered > budget) {
         kept = i;
         break;
@@ -190,7 +337,29 @@ export function fitPendingSlice(
     }
     if (fenceMatch) {
       codeFence = fenceMatch[1]!;
-      rendered += estimateWrappedRows(line, contentWidth);
+      // Lookahead to the closing fence: colorizeCode pads its line numbers to
+      // the widest one the block will draw, so the gutter — and the body's
+      // text box — depend on the block's line count, not on a constant. A
+      // block whose numbering starts past 1 pads one column wider at most;
+      // the gutter is then under-modeled by a single column, the safe side.
+      let close = -1;
+      for (let k = i + 1; k < allLines.length; k++) {
+        const closing = CODE_FENCE_RE.exec(allLines[k]!);
+        if (
+          closing &&
+          closing[1]!.startsWith(codeFence[0]!) &&
+          closing[1]!.length >= codeFence.length
+        ) {
+          close = k;
+          break;
+        }
+      }
+      const bodyCount = (close === -1 ? allLines.length : close) - (i + 1);
+      activeCodeLineWidth =
+        contentWidth -
+        CODE_BLOCK_PREFIX_PADDING -
+        (showLineNumbers ? String(bodyCount).length + 1 : 0);
+      rendered += estimateLineRows(line, contentWidth);
       if (rendered > budget) {
         kept = i;
         break;
@@ -315,7 +484,7 @@ export function fitPendingSlice(
         break;
       }
     } else {
-      rendered += estimateWrappedRows(line, contentWidth);
+      rendered += estimateLineRows(line, contentWidth);
       if (rendered > budget) {
         kept = i;
         break;
@@ -323,5 +492,9 @@ export function fitPendingSlice(
       i++;
     }
   }
-  return { keptLines: kept, clipped: kept < allLines.length };
+  return {
+    keptLines: kept,
+    clipped: kept < allLines.length,
+    renderedRows: rendered,
+  };
 }
