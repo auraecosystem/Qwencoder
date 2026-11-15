@@ -28,6 +28,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  statSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { isEntryPoint } from './lib/entry-point.js';
@@ -151,6 +152,19 @@ function readIfExists(path) {
   } catch {
     return UNREADABLE;
   }
+}
+
+// Root-aware containment. A root of '/' contains every path, so it must fail
+// closed rather than compare against '//' — no real path starts with '//',
+// which silently disabled the refusal for a round dir directly under a
+// root-level tmp/ (R17-1). Both the --context refusal and the --context-root
+// containment test use this so the two stay consistent.
+function withinRoot(root, p) {
+  return (
+    root === sep ||
+    p === root ||
+    p.startsWith(root.endsWith(sep) ? root : root + sep)
+  );
 }
 
 /** OIDs are quoted at every length from 7 to 40; compare by prefix. */
@@ -1000,7 +1014,7 @@ function main(argv) {
       );
       return 2;
     }
-    if (realDir !== realRoot && !realDir.startsWith(realRoot + sep)) {
+    if (!withinRoot(realRoot, realDir)) {
       process.stderr.write(
         `verify-pr check: --context-root ${contextRoot} does not contain the artifact directory ${dir}\n\n${HELP}`,
       );
@@ -1133,10 +1147,40 @@ function main(argv) {
           ? realpathSync(dirname(container))
           : realpathSync(dir);
     }
-    if (realContext === trustRoot || realContext.startsWith(trustRoot + sep)) {
-      process.stderr.write(
-        `verify-pr check: --context must not point inside the PR-writable worktree (${contextPath}): it cannot judge its own waiver — pass a host-held copy the round never saw\n`,
-      );
+    const insideByPath = withinRoot(trustRoot, realContext);
+    // A hard link gives a PR-writable file a second name outside the trust
+    // root; realpath cannot see the source name, but a freshly written host
+    // copy has exactly one link, so a link count above one means the context
+    // shares an inode with another name the round may control (R17-1). This
+    // needs no walk of the PR-writable tree, so an unreadable subdirectory or
+    // a source outside the artifact dir cannot hide the alias (R1-1, R1-2).
+    // Only check when the path test did not already refuse.
+    let contextIsAlias = false;
+    let contextLinks = 0;
+    if (!insideByPath) {
+      try {
+        const ctxStat = statSync(realContext);
+        if (ctxStat.isFile()) {
+          contextLinks = ctxStat.nlink;
+          contextIsAlias = ctxStat.nlink !== 1;
+        }
+      } catch {
+        // A missing/unreadable context is reported by the head-OID check below.
+      }
+    }
+    if (insideByPath || contextIsAlias) {
+      // One sentence per cause: for an alias or a '/' trust root the path is
+      // demonstrably outside the worktree, so the path-inside wording would
+      // be false and its remedy unreachable (R1-4).
+      let reason;
+      if (contextIsAlias) {
+        reason = `--context ${contextPath} is a hard link (${contextLinks} names) to a file the round can write; copy it instead of linking it, so the coordinates judging the waiver come from a host-held copy the round never saw`;
+      } else if (trustRoot === sep) {
+        reason = `--context ${contextPath} cannot be trusted: the trust root is '${trustRoot}', which contains every path — pass --context-root <pr-clone> naming the PR clone, or move the artifact dir out of root-level tmp/`;
+      } else {
+        reason = `--context must not point inside the PR-writable worktree (${contextPath}): it cannot judge its own waiver — pass a host-held copy the round never saw`;
+      }
+      process.stderr.write(`verify-pr check: ${reason}\n`);
       return 1;
     }
     const snapshotText = readIfExists(contextPath);
