@@ -322,8 +322,10 @@ describe('Settings Loading and Merging', () => {
           SETTINGS_DIRECTORY_NAME,
           'settings.json',
         );
-        (mockFsExistsSync as Mock).mockImplementation(
-          (p: fs.PathLike) => p.toString() === homeSettingsPath,
+        (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) =>
+          [homeSettingsPath, pathActual.dirname(homeSettingsPath)].includes(
+            p.toString(),
+          ),
         );
         (fs.readFileSync as Mock).mockImplementation(() =>
           JSON.stringify({ ui: { theme: 'Default' } }),
@@ -354,8 +356,12 @@ describe('Settings Loading and Merging', () => {
           SETTINGS_DIRECTORY_NAME,
           'settings.json',
         );
-        (mockFsExistsSync as Mock).mockImplementation(
-          (p: fs.PathLike) => p.toString() === userSettingsPath,
+        // Report the file's directory too, as above: on Linux a missing
+        // ~/.qwen makes the XDG directory the global dir.
+        (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) =>
+          [userSettingsPath, pathActual.dirname(userSettingsPath)].includes(
+            p.toString(),
+          ),
         );
         (fs.readFileSync as Mock).mockImplementation(
           (p: fs.PathOrFileDescriptor) =>
@@ -387,8 +393,10 @@ describe('Settings Loading and Merging', () => {
           SETTINGS_DIRECTORY_NAME,
           'settings.json',
         );
-        (mockFsExistsSync as Mock).mockImplementation(
-          (p: fs.PathLike) => p.toString() === homeSettingsPath,
+        (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) =>
+          [homeSettingsPath, pathActual.dirname(homeSettingsPath)].includes(
+            p.toString(),
+          ),
         );
         (fs.readFileSync as Mock).mockImplementation(() =>
           JSON.stringify({
@@ -3226,10 +3234,7 @@ describe('Settings Loading and Merging', () => {
     });
 
     it('should resolve ${VAR} from ~/.env when QWEN_HOME is not set (#4466)', () => {
-      const homeEnvPath = path.join(
-        path.dirname(path.dirname(USER_SETTINGS_PATH)),
-        '.env',
-      );
+      const homeEnvPath = path.join('/mock/home/user', '.env');
       const userSettingsContent = {
         mcpServers: {
           myServer: {
@@ -3267,12 +3272,9 @@ describe('Settings Loading and Merging', () => {
       delete process.env['HOME_ENV_TOKEN'];
     });
 
-    it('should prefer ~/.qwen/.env over ~/.env for the same key (first-write-wins) (#4466)', () => {
+    it('should prefer the global dir .env over ~/.env for the same key (first-write-wins) (#4466)', () => {
       const qwenEnvPath = path.join(path.dirname(USER_SETTINGS_PATH), '.env');
-      const homeEnvPath = path.join(
-        path.dirname(path.dirname(USER_SETTINGS_PATH)),
-        '.env',
-      );
+      const homeEnvPath = path.join('/mock/home/user', '.env');
       const userSettingsContent = {
         mcpServers: {
           myServer: {
@@ -6712,8 +6714,13 @@ describe('Settings Loading and Merging', () => {
           isTrusted: true,
           source: 'file',
         });
+        // ~/.qwen exists, so it is the default global dir on Linux too.
         (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) =>
-          [USER_SETTINGS_PATH, userQwenEnvPath].includes(p.toString()),
+          [
+            USER_SETTINGS_PATH,
+            userQwenEnvPath,
+            path.dirname(userQwenEnvPath),
+          ].includes(p.toString()),
         );
         (fs.readFileSync as Mock).mockImplementation(
           (p: fs.PathOrFileDescriptor) => {
@@ -6740,7 +6747,9 @@ describe('Settings Loading and Merging', () => {
         const userQwenEnvPath = path.join('/mock/home/user', QWEN_DIR, '.env');
 
         (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) =>
-          [userQwenEnvPath].includes(p.toString()),
+          [userQwenEnvPath, path.dirname(userQwenEnvPath)].includes(
+            p.toString(),
+          ),
         );
         (fs.readFileSync as Mock).mockImplementation(
           (p: fs.PathOrFileDescriptor) => {
@@ -6861,7 +6870,11 @@ describe('Settings Loading and Merging', () => {
           source: 'file',
         });
         (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) =>
-          [userQwenEnvPath, customSettingsPath].includes(p.toString()),
+          [
+            userQwenEnvPath,
+            path.dirname(userQwenEnvPath),
+            customSettingsPath,
+          ].includes(p.toString()),
         );
         (fs.readFileSync as Mock).mockImplementation(
           (p: fs.PathOrFileDescriptor) => {
@@ -6899,7 +6912,9 @@ describe('Settings Loading and Merging', () => {
         (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) => {
           const s = p.toString();
           // Legacy settings exist, active QWEN_HOME settings do not.
-          if (s === legacySettings) return true;
+          if (s === legacySettings || s === path.dirname(legacySettings)) {
+            return true;
+          }
           if (s === customSettingsPath) return false;
           return false;
         });
@@ -6950,7 +6965,7 @@ describe('Settings Loading and Merging', () => {
           source: 'file',
         });
         (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) =>
-          [legacySettings].includes(p.toString()),
+          [legacySettings, path.dirname(legacySettings)].includes(p.toString()),
         );
         (fs.readFileSync as Mock).mockImplementation(() => '{}');
 
@@ -6960,6 +6975,7 @@ describe('Settings Loading and Merging', () => {
           w.includes('QWEN_HOME points to'),
         );
         expect(warningMatch).toBeUndefined();
+        expect(loaded.user.path).toBe(legacySettings);
       });
 
       it('prefers QWEN_HOME/.env over ~/.env at the home-dir step', () => {
@@ -7014,11 +7030,15 @@ describe('Settings Loading and Merging', () => {
           source: 'file',
         });
         // Only the legacy ~/.qwen/.env exists; <QWEN_HOME>/.env, the active
-        // settings.json under <QWEN_HOME>, and ~/.env all do not.
+        // settings.json under <QWEN_HOME>, and ~/.env all do not. ~/.qwen
+        // itself exists, so it is the default global dir on Linux too.
         (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) =>
-          [USER_SETTINGS_PATH, customSettingsPath, userQwenEnvPath].includes(
-            p.toString(),
-          ),
+          [
+            USER_SETTINGS_PATH,
+            customSettingsPath,
+            userQwenEnvPath,
+            path.dirname(userQwenEnvPath),
+          ].includes(p.toString()),
         );
         (fs.readFileSync as Mock).mockImplementation(
           (p: fs.PathOrFileDescriptor) => {
