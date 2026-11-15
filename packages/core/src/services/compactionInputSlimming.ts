@@ -7,7 +7,9 @@
 import type { Content, Part } from '@google/genai';
 import type { ChatCompressionSettings } from '../config/config.js';
 import type { InputModalities } from '../core/contentGenerator.js';
+import { VISUAL_PIXELS_PER_TOKEN } from '../omni/estimation.js';
 import { ToolNames } from '../tools/tool-names.js';
+import { parseImageDimensions } from '../utils/image-dimensions.js';
 
 /**
  * Prepares `historyToCompress` for the side-query summary model by
@@ -212,7 +214,9 @@ export function estimatePartChars(
   imageTokenEstimate: number,
 ): number {
   if (part.inlineData || part.fileData) {
-    return imageTokenEstimate * TOKEN_TO_CHAR_RATIO;
+    return (
+      estimateInlineImageTokens(part, imageTokenEstimate) * TOKEN_TO_CHAR_RATIO
+    );
   }
   if (typeof part.text === 'string') {
     return part.text.length;
@@ -257,6 +261,81 @@ export function estimatePartChars(
 export function getFunctionResponseParts(part: Part): Part[] | undefined {
   const fr = part.functionResponse as { parts?: unknown } | undefined;
   return Array.isArray(fr?.parts) ? (fr.parts as Part[]) : undefined;
+}
+
+/**
+ * Token estimate for an inline image (#17315): when the
+ * base64 payload carries a parseable image header, charge the patch-grid
+ * formula the omni pipeline already uses (pixels / VISUAL_PIXELS_PER_TOKEN)
+ * so a small screenshot and a 4K diagram stop costing the same flat 1600.
+ * Anything unparseable — other binary kinds, fileData without bytes —
+ * keeps the configured flat estimate.
+ */
+function estimateInlineImageTokens(
+  part: Part,
+  resolvedTokenEstimate: number,
+): number {
+  // An explicitly configured estimate (env `QWEN_IMAGE_TOKEN_ESTIMATE` or
+  // `chatCompression.imageTokenEstimate`) is an override — it must keep
+  // having an effect. Resolution-derived costing runs only when the
+  // resolved value IS the default, so any other number is the user's
+  // deliberate answer (#17321 maintainer call).
+  if (resolvedTokenEstimate !== DEFAULT_IMAGE_TOKEN_ESTIMATE) {
+    return resolvedTokenEstimate;
+  }
+  const inline = part.inlineData;
+  if (!inline?.data || !inline.mimeType?.startsWith('image/')) {
+    return resolvedTokenEstimate;
+  }
+  try {
+    const buffer = Buffer.from(inline.data, 'base64');
+    const bytes = new Uint8Array(
+      buffer.buffer,
+      buffer.byteOffset,
+      buffer.byteLength,
+    );
+    // Animated payloads (multi-frame GIF, animated WebP) bill the flat
+    // estimate until frame counting lands: a 60-frame GIF at the static
+    // formula would be a 27x regression in the unsafe direction
+    // (#17321 maintainer call).
+    if (isPotentiallyAnimated(bytes, inline.mimeType)) {
+      return resolvedTokenEstimate;
+    }
+    const dimensions = parseImageDimensions(bytes);
+    if (!dimensions) return resolvedTokenEstimate;
+    return Math.ceil(
+      (dimensions.width * dimensions.height) / VISUAL_PIXELS_PER_TOKEN,
+    );
+  } catch {
+    return resolvedTokenEstimate;
+  }
+}
+
+/**
+ * Conservative animation check: a GIF with more than one image descriptor
+ * or a WebP with the ANIM flag or ANMF chunks is potentially animated.
+ * Static forms continue on the resolution path.
+ */
+function isPotentiallyAnimated(bytes: Uint8Array, mime: string): boolean {
+  if (mime === 'image/gif') {
+    // GIF is always flat: counting image descriptors (0x2C) by byte scan
+    // is wrong in both directions — 0x2C appears in palette data and
+    // comments (false positive on static GIFs), while compact animated
+    // frames can have descriptors beyond the 4 KiB window (false
+    // negative). Frame counting needs a real parser, not a heuristic
+    // (#17321 R1-1).
+    return true;
+  }
+  if (mime === 'image/webp' && bytes.length > 16) {
+    // VP8X flags byte at payload offset 0: bit 1 (value 2) is ANIM —
+    // a real bit in the header, not a heuristic.
+    const tag = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
+    if (tag === 'VP8X' && bytes.length > 20) {
+      return (bytes[20] & 0x02) !== 0;
+    }
+    return false;
+  }
+  return false;
 }
 
 export function estimateContentChars(
