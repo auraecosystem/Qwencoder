@@ -10,8 +10,11 @@
 // from being sent to a pool it cannot reach.
 // The association routing for DOWNSTREAM lanes lives in the `pick_runner`
 // shell step, which publishes `ubuntu_runner` (association-gated) and
-// `lint_runner` (untrusted forks use the disposable ARM64 pool). The matrix below
-// pins the gate's association-gated routing AND that ubuntu_runner keeps the
+// `lint_runner` (untrusted forks use the disposable ARM64 pool). Every
+// self-hosted branch also requires the canonical repository name: a fork
+// named `qwen-code` otherwise satisfies SAME_REPO on its own PRs and takes
+// labels for a pool it cannot reach (#17222). The matrix below pins the
+// gate's association-gated routing AND that ubuntu_runner keeps the
 // association gate for the test/integration lanes.
 //
 // test_windows carries a deliberately different policy. A pull_request run
@@ -165,6 +168,7 @@ function runPickRunnerOutputs({
   eventName,
   dispatch,
   fleet,
+  repoName = 'QwenLM/qwen-code',
 }) {
   const tmp = mkdtempSync(join(tmpdir(), 'pick-runner-'));
   const outputFile = join(tmp, 'github_output');
@@ -176,6 +180,7 @@ function runPickRunnerOutputs({
       EVENT_NAME: eventName,
       LINUX_RUNNER_FLEET: fleet ?? '',
       DISPATCH_LINUX_RUNNER: dispatch ?? '',
+      REPO_NAME: repoName,
       GITHUB_OUTPUT: outputFile,
     },
     encoding: 'utf8',
@@ -207,10 +212,18 @@ function runPickRunnerOutputs({
     .split('\n')
     .find((line) => line.startsWith('pr_test_runner='));
   assert.ok(prTest, 'pr_test_runner not published');
+  // R1-1 (#17231 review): the step must also log the inputs that decide
+  // the selection, so a silent fallback is distinguishable from an
+  // ordinary fork run in the log.
+  const inputsLine = result.stdout
+    .split('\n')
+    .find((line) => line.startsWith('Runner routing inputs: '));
+  assert.ok(inputsLine, `no routing-inputs line: ${result.stdout}`);
   return {
     ubuntuRunner,
     lintRunner,
     prTestRunner: prTest.slice('pr_test_runner='.length),
+    inputsLine,
   };
 }
 
@@ -591,6 +604,115 @@ describe('ci.yml lint_runner routing', () => {
         fleet,
       });
       assert.equal(out.lintRunner, out.ubuntuRunner, `fleet='${fleet}'`);
+    }
+  });
+});
+
+describe('ci.yml pick_runner canonical-repo guard', () => {
+  // #17222: pick_runner knew SAME_REPO and the author association but not
+  // which repository it was running in, so a PR inside a fork named
+  // `qwen-code` took the self-hosted labels for all three outputs and
+  // queued forever. Every self-hosted branch now requires the canonical
+  // repository name as well.
+  const FORK = 'alice/qwen-code';
+
+  it('keeps a fork-internal PR on hosted runners for all three outputs', () => {
+    const out = runPickRunnerOutputs({
+      ecsDisabled: false,
+      sameRepo: true,
+      assoc: 'OWNER',
+      eventName: 'pull_request',
+      repoName: FORK,
+    });
+    assert.equal(out.ubuntuRunner, HOSTED);
+    assert.equal(out.prTestRunner, HOSTED);
+    assert.equal(out.lintRunner, HOSTED);
+  });
+
+  it('keeps a fork dispatch and a cross-fork PR off the self-hosted pools', () => {
+    const dispatched = runPickRunnerOutputs({
+      ecsDisabled: false,
+      sameRepo: false,
+      assoc: '',
+      eventName: 'workflow_dispatch',
+      dispatch: 'self-hosted',
+      repoName: FORK,
+    });
+    assert.equal(dispatched.ubuntuRunner, HOSTED);
+    assert.equal(dispatched.prTestRunner, HOSTED);
+    assert.equal(dispatched.lintRunner, HOSTED);
+    // The ephemeral branch fires on a PR from a *different* fork
+    // (SAME_REPO=false, untrusted author); in a fork that pool is just as
+    // unreachable as the fleet.
+    const crossFork = runPickRunnerOutputs({
+      ecsDisabled: false,
+      sameRepo: false,
+      assoc: 'NONE',
+      eventName: 'pull_request',
+      repoName: FORK,
+    });
+    assert.equal(crossFork.ubuntuRunner, HOSTED);
+    assert.equal(crossFork.prTestRunner, HOSTED);
+    assert.equal(crossFork.lintRunner, HOSTED);
+  });
+
+  it('keeps the canonical repository on the fleet for the same inputs', () => {
+    const out = runPickRunnerOutputs({
+      ecsDisabled: false,
+      sameRepo: true,
+      assoc: 'OWNER',
+      eventName: 'pull_request',
+      repoName: 'QwenLM/qwen-code',
+    });
+    assert.equal(out.ubuntuRunner, ECS);
+    assert.equal(out.prTestRunner, ECS);
+    assert.equal(out.lintRunner, ECS);
+  });
+
+  it('wires the repository name into pick_runner', () => {
+    assert.equal(pickRunner.env.REPO_NAME, '${{ github.repository }}');
+  });
+
+  it('logs every routing input on one line, without reusing a parsed prefix', () => {
+    // R1-1 (#17231 review): the selection echoes alone cannot tell a
+    // silent fallback apart from an ordinary fork run. The inputs line
+    // must carry every input that decides the selection — including the
+    // dispatch input, which is the one the canonical-repo conjunction can
+    // drop — and must not reuse a prefix the harness parses, since the
+    // harness takes the FIRST line per prefix.
+    const out = runPickRunnerOutputs({
+      ecsDisabled: false,
+      sameRepo: false,
+      assoc: 'NONE',
+      eventName: 'workflow_dispatch',
+      dispatch: 'self-hosted',
+      fleet: 'arm64',
+      repoName: FORK,
+    });
+    for (const fragment of [
+      'REPO_NAME=alice/qwen-code',
+      'canonical_repo=false',
+      'SAME_REPO=false',
+      'trusted_author=false',
+      'EVENT_NAME=workflow_dispatch',
+      'ECS_DISABLED=',
+      'LINUX_RUNNER_FLEET=arm64',
+      'DISPATCH_LINUX_RUNNER=self-hosted',
+    ]) {
+      assert.ok(
+        out.inputsLine.includes(fragment),
+        `inputs line must carry ${fragment}: ${out.inputsLine}`,
+      );
+    }
+    for (const prefix of [
+      'Selected Linux runner: ',
+      'Selected lint runner: ',
+      'pr_test_runner=',
+    ]) {
+      assert.ok(
+        !out.inputsLine.startsWith(prefix),
+        `inputs line must not reuse the parsed prefix ${prefix}`,
+      );
     }
   });
 });
