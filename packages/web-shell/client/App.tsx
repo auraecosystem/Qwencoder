@@ -14732,11 +14732,11 @@ export function App({
   }, []);
 
   const workspaceSettingsState = useSettings({
-    autoLoad: projectFeaturesAvailable,
-    enabled: projectFeaturesAvailable,
+    autoLoad: true,
+    enabled: true,
   });
   const providersEnabled =
-    projectFeaturesAvailable &&
+    (projectFeaturesAvailable || settingsAvailable) &&
     (activePanel === 'settings' || modelDialogMode === 'fast');
   const providersState = useProviders({
     autoLoad: providersEnabled,
@@ -14777,10 +14777,7 @@ export function App({
     setValue: setWorkspaceSetting,
     reload: reloadWorkspaceSettings,
   } = workspaceSettingsState;
-  const workspaceSettings = useMemo(
-    () => (projectFeaturesAvailable ? loadedWorkspaceSettings : []),
-    [loadedWorkspaceSettings, projectFeaturesAvailable],
-  );
+  const workspaceSettings = loadedWorkspaceSettings;
   const availableApprovalModes = useApprovalModes(
     activeWorkspaceCwd,
     allowedApprovalModes,
