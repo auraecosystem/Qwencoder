@@ -2543,6 +2543,32 @@ export class LlmChat {
   private lastCachedContentTokenCount = 0;
 
   /**
+   * The live context-usage numbers behind `get_context_remaining`: the last
+   * prompt count the route reported (or the local estimate when the route
+   * has not reported yet), the previous response's output count, and the
+   * window those are measured against. Read-only; the fields themselves
+   * stay private so the send path keeps owning them (#17313).
+   */
+  getContextUsageSnapshot(): {
+    promptTokens: number;
+    promptTokensIsEstimated: boolean;
+    outputTokens: number;
+    contextWindowTokens: number;
+  } {
+    // Compose the existing accessors rather than reading the private slots
+    // directly: they run adoptTokenCountsForRoute() so the counts match the
+    // current route's window instead of whichever route last reported.
+    return {
+      promptTokens: this.getLastPromptTokenCount(),
+      promptTokensIsEstimated: this.isLastPromptTokenCountEstimated(),
+      outputTokens: this.getLastOutputTokenCount(),
+      contextWindowTokens:
+        this.config.getContentGeneratorConfig()?.contextWindowSize ??
+        DEFAULT_TOKEN_LIMIT,
+    };
+  }
+
+  /**
    * Route identity (model + auth type + endpoint; see
    * Config.getModelRouteIdentity) of the content generator that produced
    * the counts above. API-reported sizes are wire-specific: one route's
