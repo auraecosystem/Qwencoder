@@ -1249,6 +1249,47 @@ async function isShellCommandReadOnlyInternal(
 // Public API: extractCommandRules
 // ---------------------------------------------------------------------------
 
+/** Words after a redirection belong to its command, not to the target. */
+function getRedirectRuleArguments(redirect: SyntaxNode): SyntaxNode[] | null {
+  if (redirect.hasError) return null;
+  if (redirect.type === 'file_redirect') {
+    const operator = redirect.children.find(
+      (child) => child.type !== 'file_descriptor',
+    );
+    if (!operator) return null;
+    // Descriptor-close operators consume no target word; every other file
+    // redirection consumes exactly one.
+    const ownWords = ['<&-', '>&-'].includes(operator.type) ? 0 : 1;
+    const destinations = redirect.childrenForFieldName('destination');
+    return destinations.length < ownWords ? null : destinations.slice(ownWords);
+  }
+  // A here-string's input stays in its redirect node; trailing arguments
+  // are already fields on the command itself.
+  if (redirect.type === 'herestring_redirect') return [];
+  if (redirect.type !== 'heredoc_redirect') return null;
+
+  const args: SyntaxNode[] = [];
+  for (let index = 0; index < redirect.childCount; index++) {
+    const child = redirect.child(index)!;
+    if (redirect.fieldNameForChild(index) === 'argument') {
+      args.push(child);
+    } else if (child.type.endsWith('_redirect')) {
+      const nested = getRedirectRuleArguments(child);
+      if (!nested) return null;
+      args.push(...nested);
+    } else if (
+      child.isNamed &&
+      !/^(?:heredoc_(?:start|body|end)|file_descriptor|comment)$/.test(
+        child.type,
+      )
+    ) {
+      // A pipeline/list inside the heredoc line is not one simple command.
+      return null;
+    }
+  }
+  return args;
+}
+
 /**
  * Extract a simple command's root + subcommand from a `command` AST node.
  *
@@ -1257,12 +1298,42 @@ async function isShellCommandReadOnlyInternal(
  *   - root + `*` if no known subcommand but has args
  *   - root only if the command has no args at all
  */
-function extractRuleFromCommand(commandNode: SyntaxNode): string | null {
+function extractRuleFromCommand(
+  commandNode: SyntaxNode,
+  redirects: SyntaxNode[] = [],
+): string | null {
   const rootName = getCommandName(commandNode);
-  if (!rootName) return null;
+  if (!rootName || commandNode.hasError) return null;
 
+  const allRedirects = [
+    ...commandNode.namedChildren.filter((child) =>
+      child.type.endsWith('_redirect'),
+    ),
+    ...redirects,
+  ];
   const argNodes = getArgumentNodes(commandNode);
-  const argTexts = argNodes.map((n) => n.text);
+  for (const redirect of allRedirects) {
+    const trailing = getRedirectRuleArguments(redirect);
+    if (!trailing) return null;
+    argNodes.push(...trailing);
+  }
+  const argTexts = argNodes
+    .filter(
+      (arg) =>
+        // tree-sitter can attach an input fd to the preceding command (or
+        // redirect). Only an unquoted number adjacent to < or > is an fd.
+        !(
+          arg.type === 'number' &&
+          /^\d+$/.test(arg.text) &&
+          allRedirects.some(
+            (redirect) =>
+              arg.endIndex === redirect.startIndex &&
+              /^[<>]/.test(redirect.text),
+          )
+        ),
+    )
+    .sort((left, right) => left.startIndex - right.startIndex)
+    .map((arg) => arg.text);
 
   // Skip leading flags to find potential subcommand
   let idx = 0;
@@ -1315,15 +1386,40 @@ function extractRuleFromCommand(commandNode: SyntaxNode): string | null {
  * Recursively extract rules from a statement node.
  * Handles pipeline, list, redirected_statement, etc.
  */
-function extractRulesFromStatement(node: SyntaxNode): string[] {
+function extractRulesFromStatement(
+  node: SyntaxNode,
+  redirects: SyntaxNode[] = [],
+): string[] {
   switch (node.type) {
     case 'command':
-      return [extractRuleFromCommand(node)].filter(Boolean) as string[];
+      return [extractRuleFromCommand(node, redirects)].filter(
+        Boolean,
+      ) as string[];
 
     case 'pipeline':
-    case 'list':
+    case 'list': {
+      const children = node.namedChildren.filter(
+        (child) => child.type !== 'comment',
+      );
+      // A redirect after a list/pipeline belongs to its final command.
+      return children.flatMap((child, index) =>
+        extractRulesFromStatement(
+          child,
+          index === children.length - 1 ? redirects : [],
+        ),
+      );
+    }
+
     case 'compound_statement':
     case 'subshell': {
+      // Redirects on a group cannot append argv to a command inside it.
+      if (
+        redirects.some(
+          (redirect) => getRedirectRuleArguments(redirect)?.length !== 0,
+        )
+      ) {
+        return [];
+      }
       const rules: string[] = [];
       for (const child of node.namedChildren) {
         rules.push(...extractRulesFromStatement(child));
@@ -1332,13 +1428,18 @@ function extractRulesFromStatement(node: SyntaxNode): string[] {
     }
 
     case 'redirected_statement': {
-      const body = node.namedChildren[0];
-      return body ? extractRulesFromStatement(body) : [];
+      const body = node.childForFieldName('body');
+      return body
+        ? extractRulesFromStatement(body, [
+            ...node.childrenForFieldName('redirect'),
+            ...redirects,
+          ])
+        : [];
     }
 
     case 'negated_command': {
       const inner = node.namedChildren[0];
-      return inner ? extractRulesFromStatement(inner) : [];
+      return inner ? extractRulesFromStatement(inner, redirects) : [];
     }
 
     case 'variable_assignment':
