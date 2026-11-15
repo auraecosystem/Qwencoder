@@ -8937,6 +8937,7 @@ async function runQwenServeImpl(
                     'Workspace bridge shutdown could not be confirmed.',
                   );
                 }
+                throw shutdownError;
               }
             }
             bridgeStopped = true;
