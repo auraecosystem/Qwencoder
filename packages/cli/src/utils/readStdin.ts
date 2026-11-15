@@ -4,7 +4,25 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { writeStderrLine } from './stdioHelpers.js';
+import { writeStderrLineSafe } from './stdioHelpers.js';
+
+const epipeGuardedStreams = new WeakSet<NodeJS.WriteStream>();
+
+function writeStderrWarningSafe(message: string): void {
+  const stderr = process.stderr as NodeJS.WriteStream | undefined;
+  if (!stderr) {
+    return;
+  }
+  if (typeof stderr.on === 'function' && !epipeGuardedStreams.has(stderr)) {
+    epipeGuardedStreams.add(stderr);
+    stderr.on('error', (err: NodeJS.ErrnoException): void => {
+      if (err.code === 'EPIPE' && typeof stderr.destroy === 'function') {
+        stderr.destroy();
+      }
+    });
+  }
+  writeStderrLineSafe(message);
+}
 
 function takeUtf8Prefix(value: string, maxBytes: number): string {
   let bytes = 0;
@@ -22,7 +40,11 @@ function takeUtf8Prefix(value: string, maxBytes: number): string {
   return value.slice(0, end);
 }
 
-export async function readStdin(): Promise<string> {
+export interface ReadStdinOptions {
+  warnOnTimeout?: boolean;
+}
+
+export async function readStdin(options?: ReadStdinOptions): Promise<string> {
   const MAX_STDIN_SIZE = 8 * 1024 * 1024; // 8MB
   return new Promise((resolve, reject) => {
     let data = '';
@@ -35,6 +57,11 @@ export async function readStdin(): Promise<string> {
       // stop reading if input is not available yet, this is needed
       // in terminals where stdin is never TTY and nothing's piped
       // which causes the program to get stuck expecting data from stdin
+      if (options?.warnOnTimeout && totalSize === 0) {
+        writeStderrWarningSafe(
+          `Warning: no stdin input received within ${pipedInputShouldBeAvailableInMs}ms; proceeding without stdin.`,
+        );
+      }
       onEnd();
     }, pipedInputShouldBeAvailableInMs);
 
@@ -52,7 +79,7 @@ export async function readStdin(): Promise<string> {
           const prefix = takeUtf8Prefix(chunk, remainingSize);
           data += prefix;
           totalSize += Buffer.byteLength(prefix, 'utf8');
-          writeStderrLine(
+          writeStderrWarningSafe(
             `Warning: stdin input truncated to ${MAX_STDIN_SIZE} bytes.`,
           );
           finish();
