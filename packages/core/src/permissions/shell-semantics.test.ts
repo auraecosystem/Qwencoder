@@ -564,8 +564,10 @@ describe('extractShellOperations', () => {
     expect(ops(command)).toEqual([write(`${CWD}/${file}`)]);
   });
 
-  it('>&$VAR keeps the literal write: it may name a file', () => {
-    expect(ops('printf TXT >&$OUT')).toEqual([write(`${CWD}/&$OUT`)]);
+  it('>&$VAR keeps an unresolved write: it may name a file', () => {
+    expect(ops('printf TXT >&$OUT')).toEqual([
+      { ...write(`${CWD}/&$OUT`), pathUnknown: true },
+    ]);
   });
 
   // Only a whole number or `-` is a descriptor; anything else names a file.
@@ -613,8 +615,17 @@ describe('extractShellOperations', () => {
     ['tee >&-2', [write(`${CWD}/&-2`)]],
     ['tee 2>&-2', [write(`${CWD}/&-2`)]],
     ['cat <&-2', [read(`${CWD}/&-2`)]],
-    ['tee >&-$HOME/.bashrc', [write(`${CWD}/&-$HOME/.bashrc`)]],
-    ['tee >&-{a,b}', [write(`${CWD}/&-{a,b}`)]],
+    [
+      'tee >&-$HOME/.bashrc',
+      [{ ...write(`${CWD}/&-$HOME/.bashrc`), pathUnknown: true }],
+    ],
+    [
+      'tee >&-{a,b}',
+      sorted([
+        { ...write(`${CWD}/&-{a,b}`), pathUnknown: true },
+        { ...write(`${CWD}/{a,b}`), pathUnknown: true },
+      ]),
+    ],
     ['my-tool >&-notes.txt', [write(`${CWD}/&-notes.txt`)]],
     ['rm -- >&--x', [write(`${CWD}/&--x`)]],
     ['printf X >&->&"-x"', [write(`${CWD}/-x`), write(`${CWD}/&->&-x`)]],
@@ -1060,10 +1071,103 @@ describe('ANSI-C bytes that are not valid UTF-8', () => {
     [String.raw`cat $'\xc3'`, '/repo/\udcc3'],
     [String.raw`cat $'\uD800'`, '/repo/\udced\udca0\udc80'],
     [String.raw`cat $'\U00110000'`, '/repo/\udcf4\udc90\udc80\udc80'],
-  ])('keeps one character per byte: %s', (command, path) => {
-    expect(extractShellOperationsAcrossCommand(command, '/repo')).toEqual([
-      read(path),
+  ])(
+    'keeps one character per byte but marks the path unresolved: %s',
+    (command, path) => {
+      expect(extractShellOperationsAcrossCommand(command, '/repo')).toEqual([
+        { ...read(path), pathUnknown: true },
+      ]);
+    },
+  );
+  it('does not pair a raw lone high surrogate with a decoded invalid byte', () => {
+    const command = 'cat \uD800' + String.raw`$'\xff'`;
+    expect(extractShellOperations(command, '/repo')).toEqual([
+      { ...read('/repo/\uDC00\uDCFF'), pathUnknown: true },
     ]);
+  });
+
+  it('does not pair a raw lone high surrogate across a wrapper byte boundary', () => {
+    const command = "sh -c 'cat \uD800'" + String.raw`$'\xff'`;
+    expect(extractShellOperationsAcrossCommand(command, '/repo')).toEqual([
+      { ...read('/repo/\uDC00\uDCFF'), pathUnknown: true },
+    ]);
+  });
+
+  it.each([
+    [
+      'a double-quoted wrapper payload',
+      String.raw`bash -c "printf ok > $'\\xff'"`,
+      'write_file',
+    ],
+    [
+      'a double-quoted payload with an expansion',
+      String.raw`bash -c "printf $VALUE > $'\\xff'"`,
+      'write_file',
+    ],
+    [
+      'a backslash between raw surrogate fragments',
+      'cat ' + String.fromCharCode(0xd800, 0x5c, 0xdcff),
+      'read_file',
+    ],
+    [
+      'a hex-quoted wrapper payload',
+      String.raw`sh -c $'printf ok > $\x27\xff\x27'`,
+      'write_file',
+    ],
+    [
+      'an octal-quoted wrapper payload',
+      String.raw`sh -c $'printf ok > $\047\xff\047'`,
+      'write_file',
+    ],
+    ['raw surrogates separated by quotes', "cat '\uD800'\uDCFF", 'read_file'],
+    [
+      'a raw redirect target separated by quotes',
+      "printf ok > '\uD800'\uDCFF",
+      'write_file',
+    ],
+  ])(
+    'keeps an undecodable path unresolved through %s',
+    (_label, command, tool) => {
+      const operations = extractShellOperationsAcrossCommand(command, '/repo');
+      expect(operations).toHaveLength(1);
+      expect(operations[0]).toMatchObject({
+        virtualTool: tool,
+        pathUnknown: true,
+      });
+    },
+  );
+
+  it('marks a redirect-only undecodable target unresolved', () => {
+    expect(extractShellOperations(String.raw`> $'\xff'`, '/repo')).toEqual([
+      { ...write('/repo/\udcff'), pathUnknown: true },
+    ]);
+  });
+
+  it('keeps an undecodable argument unresolved after .. normalization', () => {
+    expect(
+      extractShellOperationsAcrossCommand(
+        String.raw`cat $'\xff'/../etc/passwd`,
+        '/repo',
+      ),
+    ).toEqual([{ ...read('/repo/etc/passwd'), pathUnknown: true }]);
+  });
+
+  it('keeps later relative writes uncertain after an undecodable cd', () => {
+    expect(
+      extractShellOperationsAcrossCommand(
+        String.raw`cd $'\xff'/../dir; cat > settings.json`,
+        '/repo',
+      ),
+    ).toEqual([uncertainWrite('/repo/dir/settings.json')]);
+  });
+
+  it('keeps absolute-looking writes uncertain after an undecodable cd', () => {
+    expect(
+      extractShellOperationsAcrossCommand(
+        String.raw`cd $'\xff'/..; cat > /repo/victim.txt`,
+        '/repo',
+      ),
+    ).toEqual([uncertainWrite('/repo/victim.txt', false)]);
   });
 });
 
@@ -1071,6 +1175,9 @@ describe('ANSI-C wrapper payloads', () => {
   it.each([
     [String.raw`cat $'\xc3\xa9'`, [read('/repo/é')]],
     [String.raw`cat $'\xc3'$'\xa9'`, [read('/repo/é')]],
+    ["sh -c 'cat 😀'$'\\x41'", [read('/repo/😀A')]],
+    [String.raw`cat \😀`, [read('/repo/😀')]],
+    ["cat '😀'", [read('/repo/😀')]],
     [String.raw`cat $'a\c\\tb'`, [read('/repo/a\x1ctb')]],
     [String.raw`cat $'\c?'`, [read('/repo/\x7f')]],
     [String.raw`cat $'\x3e'/etc/passwd`, [read('/repo/>/etc/passwd')]],
@@ -1118,6 +1225,21 @@ describe('ANSI-C wrapper payloads', () => {
     expect(across(command)).toEqual([write('/etc/motd')]);
   });
 
+  it('keeps a protected write visible beside an undecodable wrapper argument', () => {
+    expect(
+      across(String.raw`sh -c $'echo {} > .qwen/settings.json; cat \xff'`),
+    ).toEqual([
+      write(REPO_SETTINGS),
+      { ...read('/repo/\udcff'), pathUnknown: true },
+    ]);
+  });
+
+  it('extracts writes from a multi-word payload carrying an undecodable byte', () => {
+    expect(
+      across(String.raw`sh -c $'printf x > secrets/real_file \xff'`),
+    ).toEqual([write('/repo/secrets/real_file')]);
+  });
+
   it('treats a decoded operator as data, not a redirect', () => {
     // `$'\x3e'` decodes to `>` and is a `>` argument to `cat`: the read of
     // the file named `>` plus the real write, not a phantom write to `>`.
@@ -1126,6 +1248,64 @@ describe('ANSI-C wrapper payloads', () => {
       write('/tmp/t'),
     ]);
   });
+});
+
+describe('unresolved redirect targets', () => {
+  it.each([
+    String.raw`D=sub; sh -c "printf {} > \"$D\"/../.qwen/settings.json"`,
+    String.raw`sh -c 'printf {} > "$OUTPUT"'`,
+    String.raw`printf ok > "😀$OUT"/../.qwen/settings.json`,
+    String.raw`printf ok > dir/"$OUT"`,
+    String.raw`printf ok > "$(pwd)/out"`,
+    'printf ok > `pwd`/out',
+    String.raw`printf '>'>"$OUT"`,
+    String.raw`cd sub > "$OUT"`,
+  ])('keeps an expanding redirect visible: %s', (command) => {
+    const operations = across(command);
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({
+      virtualTool: 'write_file',
+      pathUnknown: true,
+    });
+  });
+
+  it.each(['>', '1>', '>>', '2>', '2>>', '&>', '&>>', '>|', '2>|', '<'])(
+    'keeps an unresolved %s target in both token layouts',
+    (operator) => {
+      for (const space of ['', ' ']) {
+        expect(across(`unknown-command ${operator}${space}"$OUT"`)).toEqual([
+          {
+            virtualTool: operator === '<' ? 'read_file' : 'write_file',
+            filePath: '/repo/$OUT',
+            pathUnknown: true,
+          },
+        ]);
+      }
+    },
+  );
+
+  it.each([
+    [String.raw`'$OUT'`, '$OUT'],
+    [String.raw`\$OUT`, '$OUT'],
+    [String.raw`"\$OUT"`, '$OUT'],
+    [String.raw`$'\x24OUT'`, '$OUT'],
+    [String.raw`$'\x60OUT'`, '`OUT'],
+    [String.raw`dir/'$OUT'`, 'dir/$OUT'],
+    [String.raw`😀'$OUT'`, '😀$OUT'],
+    [String.raw`'$OUT'/../.qwen/settings.json`, '.qwen/settings.json'],
+  ])('keeps a literal target known: %s', (target, file) => {
+    expect(across(`printf ok > ${target}`)).toEqual([write(`/repo/${file}`)]);
+  });
+
+  it.each([
+    String.raw`printf "$VALUE" > .qwen/settings.json`,
+    String.raw`printf "$VALUE>">.qwen/settings.json`,
+  ])(
+    'does not attribute argument expansion to a static redirect: %s',
+    (command) => {
+      expect(across(command)).toEqual([write(REPO_SETTINGS)]);
+    },
+  );
 });
 
 describe('quoted and decoded tilde targets', () => {
@@ -1179,5 +1359,265 @@ describe('quoted and decoded tilde targets', () => {
     expect(across('cd "~/x" ; cat > y')).toEqual([
       uncertainWrite('/repo/~/x/y'),
     ]);
+  });
+});
+
+describe('prefixed directory changes', () => {
+  it.each([
+    'A=1',
+    'A="a b"',
+    'command',
+    'command -p',
+    'command --',
+    'builtin',
+    'builtin --',
+    'A=1 command',
+  ])('tracks the current shell directory through %s cd', (prefix) => {
+    expect(across(`${prefix} cd .qwen && printf '{}' > settings.json`)).toEqual(
+      [write(REPO_SETTINGS)],
+    );
+  });
+
+  it.each(['A=1', 'command', 'builtin'])(
+    'keeps argument marks aligned after %s',
+    (prefix) => {
+      expect(
+        across(`${prefix} cd $'\\x7e'; printf '{}' > settings.json`),
+      ).toEqual([uncertainWrite('/repo/~/settings.json')]);
+    },
+  );
+
+  it.each(['command -v cd', 'command -V cd'])(
+    'does not treat command lookup as a directory change: %s',
+    (command) => {
+      expect(across(`${command}; printf '{}' > settings.json`)).toEqual([
+        write('/repo/settings.json'),
+      ]);
+    },
+  );
+});
+
+describe('assignment syntax in directory changes', () => {
+  it.each(["'A=1'", "'A'=1", String.raw`A\=1`, "A''=1", "''A=1", "$''A=1"])(
+    'does not treat a quoted command word as an assignment: %s',
+    (prefix) => {
+      expect(
+        across(`${prefix} cd /elsewhere; printf '{}' > .qwen/settings.json`),
+      ).toEqual([write(REPO_SETTINGS)]);
+    },
+  );
+
+  it.each(['HOME=. cd', 'CDPATH=/elsewhere cd .qwen'])(
+    'does not guess a cwd affected by temporary variables: %s',
+    (command) => {
+      expect(across(`${command}; printf '{}' > .qwen/settings.json`)).toEqual([
+        uncertainWrite(REPO_SETTINGS),
+      ]);
+    },
+  );
+});
+
+describe('find starting-point uncertainty', () => {
+  it.each(['./$D', './*'])(
+    'keeps the marks on a find starting point: %s',
+    (target) => {
+      expect(across(`find ${target} -name x`)).toEqual([
+        { ...dir(`/repo/${target.slice(2)}`), pathUnknown: true },
+      ]);
+    },
+  );
+
+  it('retains the default and literal starting-point behavior', () => {
+    expect(across('find $D -name x')).toEqual([dir('/repo')]);
+    expect(across('find src -name x')).toEqual([dir('/repo/src')]);
+  });
+});
+
+describe('shell-expanded write paths', () => {
+  it.each([
+    "printf '{}' > .qwen/setting{s..s}.json",
+    "printf '{}' > .qwen/settings.j@(son)",
+    'touch .qwen/setting{s..s}.json',
+    'sort -o $OUT in.txt',
+    'sort --output=$OUT in.txt',
+    'cp -t $D settings.json',
+    'mv --target-directory=$D settings.json',
+    'curl -o $OUT https://example.com',
+    'wget -O $OUT https://example.com',
+    'patch -o $OUT input.patch',
+  ])('keeps the expanded destination uncertain: %s', (command) => {
+    const uncertainWrites = across(command).filter(
+      (op) =>
+        (op.virtualTool === 'write_file' || op.virtualTool === 'edit') &&
+        op.pathUnknown,
+    );
+    expect(uncertainWrites).toHaveLength(1);
+  });
+
+  it.each([
+    ['.qwen/setting{s..s}.json', '/repo/.qwen/setting{s..s}.json'],
+    ['.qwen/settings.j@(son)', '/repo/.qwen/settings.j@(son)'],
+  ])('keeps a quoted expansion literal: %s', (target, path) => {
+    expect(across(`printf '{}' > '${target}'`)).toEqual([write(path)]);
+  });
+
+  it('does not mistake an awk program for a brace-expanded filename', () => {
+    expect(across("awk '{print $1}' f")).toEqual([read('/repo/f')]);
+  });
+
+  it('keeps a quoted output-flag value literal', () => {
+    expect(across("sort -o '$OUT' in.txt")).toContainEqual(write('/repo/$OUT'));
+  });
+});
+
+describe('argument marks survive the env-assignment strip', () => {
+  // `tokens` and `bares` are index-parallel. Dropping a leading assignment from
+  // only one of them gave every later argument the previous word's marks, so a
+  // destination bash resolves at runtime was certified as a literal path.
+  it.each(['cat dir/$OUT', 'X=1 cat dir/$OUT', 'X=1 Y=2 cat dir/$OUT'])(
+    'keeps the expanded read uncertain: %s',
+    (command) => {
+      expect(ops(command)).toEqual([
+        {
+          virtualTool: 'read_file',
+          filePath: `${CWD}/dir/$OUT`,
+          pathUnknown: true,
+        },
+      ]);
+    },
+  );
+
+  it.each(['cp dir/$OUT /tmp/y', 'X=1 cp dir/$OUT /tmp/y'])(
+    'marks the expanded source and not the literal destination: %s',
+    (command) => {
+      expect(ops(command)).toEqual([
+        {
+          virtualTool: 'read_file',
+          filePath: `${CWD}/dir/$OUT`,
+          pathUnknown: true,
+        },
+        write('/tmp/y'),
+      ]);
+    },
+  );
+
+  it('leaves a fully literal prefixed command known', () => {
+    expect(ops('X=1 cat /tmp/safe')).toEqual([read('/tmp/safe')]);
+  });
+});
+
+describe('paths a handler derives from an argument stay uncertain', () => {
+  // A flag value is a substring of its argument and a `-t` destination is a
+  // join, so neither string is ever an element of `args`. Matching finished
+  // paths against whole arguments dropped the mark for those spellings.
+  it.each([
+    'sort -o .qwen/$OUT in.txt',
+    'sort -o.qwen/$OUT in.txt',
+    'sort --output=.qwen/$OUT in.txt',
+  ])('marks the output flag in every spelling: %s', (command) => {
+    const writes = ops(command).filter((op) => op.virtualTool === 'write_file');
+    expect(writes).toEqual([
+      {
+        virtualTool: 'write_file',
+        filePath: `${CWD}/.qwen/$OUT`,
+        pathUnknown: true,
+      },
+    ]);
+  });
+
+  it.each([
+    ['curl -o.qwen/$OUT https://example.com', 'curl'],
+    ['wget -O.qwen/$OUT https://example.com', 'wget'],
+  ])('marks an attached download destination: %s', (command) => {
+    const writes = ops(command).filter((op) => op.virtualTool === 'write_file');
+    expect(writes).toEqual([
+      {
+        virtualTool: 'write_file',
+        filePath: `${CWD}/.qwen/$OUT`,
+        pathUnknown: true,
+      },
+    ]);
+  });
+
+  it.each([
+    'cp -t out/$D file',
+    'cp -tout/$D file',
+    'cp --target-directory=out/$D file',
+    'mv -t out/$D file',
+    'install -t out/$D file',
+  ])('marks a joined target-directory destination: %s', (command) => {
+    const writes = ops(command).filter((op) => op.virtualTool === 'write_file');
+    expect(writes).toEqual([
+      {
+        virtualTool: 'write_file',
+        filePath: `${CWD}/out/$D/file`,
+        pathUnknown: true,
+      },
+    ]);
+  });
+
+  it.each([
+    'sort -o/tmp/safe in.txt',
+    'sort -o /tmp/safe in.txt',
+    'curl -o/tmp/safe https://example.com',
+  ])('leaves a literal derived destination known: %s', (command) => {
+    const writes = ops(command).filter((op) => op.virtualTool === 'write_file');
+    expect(writes).toEqual([write('/tmp/safe')]);
+  });
+
+  it('leaves a literal target-directory destination known', () => {
+    const writes = ops('cp -t /tmp/safe file').filter(
+      (op) => op.virtualTool === 'write_file',
+    );
+    expect(writes).toEqual([write('/tmp/safe/file')]);
+  });
+});
+
+describe('unquoted pathname globbing is an expansion', () => {
+  // A glob character is marked bare rather than as expansion syntax, so a
+  // predicate that read only the expansion mark certified `> settings.jso?`
+  // at a name bash never opens.
+  it.each([
+    "printf '{}' > .qwen/settings.jso?",
+    "printf '{}' > .qwen/[s]ettings.json",
+    "printf '{}' > .qwen/settings.json*",
+  ])('keeps a globbed redirect target uncertain: %s', (command) => {
+    expect(across(command)).toEqual([
+      {
+        virtualTool: 'write_file',
+        filePath:
+          '/repo/.qwen/' + command.split('> ')[1]!.replace('.qwen/', ''),
+        pathUnknown: true,
+      },
+    ]);
+  });
+
+  it('keeps a globbed read argument uncertain', () => {
+    expect(ops('cat .qwen/settings.jso?')).toEqual([
+      {
+        virtualTool: 'read_file',
+        filePath: `${CWD}/.qwen/settings.jso?`,
+        pathUnknown: true,
+      },
+    ]);
+  });
+
+  it('escalates the segment after a globbed cd', () => {
+    expect(across('cd .qwen/sub? && echo x > settings.json')).toEqual([
+      uncertainWrite('/repo/.qwen/sub?/settings.json'),
+    ]);
+  });
+
+  it.each([
+    ['cat "foo*"', 'foo*'],
+    ["cat 'foo*'", 'foo*'],
+    [String.raw`cat esc\*.txt`, 'esc*.txt'],
+    ['cat data.csv', 'data.csv'],
+  ])('leaves a quoted or escaped glob literal: %s', (command, file) => {
+    expect(ops(command)).toEqual([read(`${CWD}/${file}`)]);
+  });
+
+  it('leaves an ordinary redirect known', () => {
+    expect(across('echo hi > log.txt')).toEqual([write('/repo/log.txt')]);
   });
 });

@@ -34,8 +34,10 @@
 import nodePath from 'node:path';
 import os from 'node:os';
 import {
+  concatAnsiCText,
   decodeAnsiCBytes,
   decodeAnsiCEscape,
+  hasUnpairedSurrogate,
   stripShellWrapper,
 } from '../utils/shell-utils.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
@@ -79,6 +81,8 @@ export interface ShellOperation {
    * do not depend on cwd; relative redirect/path arguments do.
    */
   pathMayDependOnCwd?: boolean;
+  /** True when expansion or undecodable bytes prevent a statically known path. */
+  pathUnknown?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,20 +109,20 @@ function tokenize(
   command: string,
   fdRedirects?: Set<number>,
   fdCloses?: Set<number>,
-  /** Parallel bare marks per pushed token; '1' = typed unquoted and unescaped. */
+  /** Parallel marks: '1' = bare, '0' = quoted/escaped, '2' = expansion syntax. */
   bares?: string[],
 ): string[] {
   const tokens: string[] = [];
   let current = '';
-  // One char per char of `current`: '1' if typed unquoted and unescaped.
+  // One mark per UTF-16 code unit; expansion marks survive quote removal.
   let bare = '';
   let wordStarted = false;
-  let tildeQuoted = false;
+  let prefixQuoted = false;
   let ansiCBytes: number[] = [];
   const flushAnsiC = () => {
     if (ansiCBytes.length === 0) return;
     const text = decodeAnsiCBytes(ansiCBytes);
-    current += text;
+    current = concatAnsiCText(current, text);
     bare += '0'.repeat(text.length);
     ansiCBytes = [];
   };
@@ -184,7 +188,13 @@ function tokenize(
         continue;
       }
       const literal = String.fromCodePoint(command.codePointAt(i)!);
-      for (const byte of Buffer.from(literal)) ansiCBytes.push(byte);
+      if (hasUnpairedSurrogate(literal)) {
+        flushAnsiC();
+        current = concatAnsiCText(current, literal);
+        bare += '0'.repeat(literal.length);
+      } else {
+        for (const byte of Buffer.from(literal)) ansiCBytes.push(byte);
+      }
       i += literal.length - 1;
       continue;
     }
@@ -193,12 +203,14 @@ function tokenize(
     while (ch === '$' && command.startsWith('\\\n', quoteAt)) quoteAt += 2;
     if (!(ch === '$' && command[quoteAt] === "'")) flushAnsiC();
     if (ch === "'" || ch === '"' || ch === '\\') {
-      if (!current.includes('/')) tildeQuoted = true;
+      if (!current.includes('/')) prefixQuoted = true;
       wordStarted = true;
     }
     if (escaped) {
-      current += ch;
-      bare += '0';
+      const literal = String.fromCodePoint(command.codePointAt(i)!);
+      current = concatAnsiCText(current, literal);
+      bare += '0'.repeat(literal.length);
+      i += literal.length - 1;
       escaped = false;
       continue;
     }
@@ -214,14 +226,14 @@ function tokenize(
       while (command[next] === '\\' && command[next + 1] === '\n') next += 2;
       if (command[next] === "'") {
         wordStarted = true;
-        if (!current.includes('/')) tildeQuoted = true;
+        if (!current.includes('/')) prefixQuoted = true;
         inAnsiC = true;
         i = next;
         continue;
       }
       if (command[next] === '"') {
         wordStarted = true;
-        if (!current.includes('/')) tildeQuoted = true;
+        if (!current.includes('/')) prefixQuoted = true;
         inDouble = true;
         i = next;
         continue;
@@ -238,7 +250,7 @@ function tokenize(
     }
     if (!inSingle && !inDouble && (ch === ' ' || ch === '\t')) {
       if (wordStarted) {
-        if (tildeQuoted && current.startsWith('~')) bare = '0' + bare.slice(1);
+        if (prefixQuoted && current.startsWith('~')) bare = '0' + bare.slice(1);
         if (current) {
           pushToken(tokens, current, bare, fdRedirects, fdCloses, bares);
         } else {
@@ -248,16 +260,25 @@ function tokenize(
         current = '';
         bare = '';
         wordStarted = false;
-        tildeQuoted = false;
+        prefixQuoted = false;
       }
       continue;
     }
-    current += ch;
+    const literal = String.fromCodePoint(command.codePointAt(i)!);
+    current = concatAnsiCText(current, literal);
     wordStarted = true;
-    bare += inSingle || inDouble ? '0' : '1';
+    // An empty quote in `A''=1` still makes it a command word, not an assignment.
+    const mark =
+      !inSingle && (ch === '$' || ch === '`')
+        ? '2'
+        : inSingle || inDouble || (ch === '=' && prefixQuoted)
+          ? '0'
+          : '1';
+    bare += mark.repeat(literal.length);
+    i += literal.length - 1;
   }
   flushAnsiC();
-  if (tildeQuoted && current.startsWith('~')) bare = '0' + bare.slice(1);
+  if (prefixQuoted && current.startsWith('~')) bare = '0' + bare.slice(1);
   if (current) pushToken(tokens, current, bare, fdRedirects, fdCloses, bares);
   else if (wordStarted) {
     tokens.push('');
@@ -386,8 +407,170 @@ function isShellAbsolutePath(p: string): boolean {
   return p.startsWith('/') || /^[A-Za-z]:\//.test(p.replace(/\\/g, '/'));
 }
 
-function isEnvAssignmentToken(token: string): boolean {
-  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(token);
+/**
+ * True when the shell can still change this word before it reaches the syscall.
+ *
+ * `$`/backtick expansion (mark '2'), unquoted brace/glob syntax and undecodable
+ * bytes all qualify. Brace and glob characters are marked '1' (bare) rather
+ * than '2', so reading only the expansion mark certifies a literal name bash
+ * may never open.
+ */
+function isUncertainPath(word: string, bare?: string): boolean {
+  if (bare?.includes('2') || hasUnpairedSurrogate(word)) return true;
+  if (bare === undefined) return false;
+  for (let i = 0; i < word.length && i < bare.length; i++) {
+    if (bare[i] !== '1') continue;
+    const ch = word[i]!;
+    if (
+      '*?[{'.includes(ch) ||
+      ('@+!'.includes(ch) && word[i + 1] === '(' && bare[i + 1] === '1')
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** One argument word and the marking of each of its characters. */
+interface ArgumentWord {
+  text: string;
+  bare: string;
+}
+
+let argumentContext: readonly ArgumentWord[] = [];
+let dispatchCwd = '';
+
+/**
+ * The marking of the argument characters `fragment` was taken from.
+ *
+ * A handler does not always use an argument whole: `getFlagValue` returns a
+ * substring (`-oPATH`, `--output=PATH`) and `targetDirectoryWrites` joins a
+ * directory with a basename. Matching finished paths against whole arguments
+ * therefore drops the mark for every derived spelling. Looking the fragment up
+ * in the source words keeps the marking attached to the characters that carry
+ * it, so `-o.qwen/$OUT` stays uncertain while `-o/tmp/safe` does not.
+ */
+function fragmentBare(fragment: string): string | undefined {
+  if (!fragment) return undefined;
+  let merged: string | undefined;
+  for (const word of argumentContext) {
+    let at = word.text.indexOf(fragment);
+    while (at >= 0) {
+      const slice = word.bare.slice(at, at + fragment.length);
+      merged = merged === undefined ? slice : mergeBares(merged, slice);
+      at = word.text.indexOf(fragment, at + 1);
+    }
+  }
+  return merged;
+}
+
+/**
+ * Marks for a path a handler already resolved.
+ *
+ * Two spellings need more than a verbatim lookup: an attached flag value
+ * (`-tout/$D`) carries a prefix the path does not, and normalization can drop
+ * the characters that carried the mark (`out/$D/..` resolves to `out`). Each
+ * suffix of an argument word is therefore resolved and compared by equality or
+ * directory prefix. The shortest matching suffix wins, so a flag prefix does
+ * not drag its own characters into the marking.
+ */
+function resolvedFragmentBare(resolved: string): string | undefined {
+  let merged = fragmentBare(resolved);
+  for (const word of argumentContext) {
+    for (let at = word.text.length - 1; at >= 0; at--) {
+      const bare = word.bare.slice(at);
+      const candidate = resolvePath(word.text.slice(at), dispatchCwd, bare);
+      if (candidate !== resolved && !resolved.startsWith(`${candidate}/`)) {
+        continue;
+      }
+      merged = merged === undefined ? bare : mergeBares(merged, bare);
+      break;
+    }
+  }
+  return merged;
+}
+
+/** Combine two markings of the same characters, keeping the strongest. */
+function mergeBares(left: string, right: string): string {
+  let merged = '';
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const a = left[i] ?? '0';
+    const b = right[i] ?? '0';
+    merged += a === '2' || b === '2' ? '2' : a === '1' || b === '1' ? '1' : '0';
+  }
+  return merged;
+}
+
+/**
+ * Build a file operation whose uncertainty follows the argument characters the
+ * path was derived from, including flag substrings and joined directories.
+ */
+function pathOperation(
+  virtualTool: ShellOperation['virtualTool'],
+  path: string,
+  cwd: string,
+  bare?: string,
+): ShellOperation {
+  const inherited = bare ?? fragmentBare(path);
+  const operation: ShellOperation = {
+    virtualTool,
+    filePath: resolvePath(path, cwd, inherited),
+  };
+  if (isUncertainPath(path, inherited)) operation.pathUnknown = true;
+  return operation;
+}
+
+/** Run a command handler with its argument words available to path resolution. */
+function dispatchHandler(
+  handler: CommandHandler,
+  args: string[],
+  cwd: string,
+  bares: string[],
+): ShellOperation[] {
+  const outer = argumentContext;
+  const outerCwd = dispatchCwd;
+  dispatchCwd = cwd;
+  argumentContext = args.map((text, index) => ({
+    text,
+    bare: bares[index] ?? '',
+  }));
+  try {
+    return handler(args, cwd);
+  } finally {
+    argumentContext = outer;
+    dispatchCwd = outerCwd;
+  }
+}
+
+function isEnvAssignmentToken(token: string, bare?: string): boolean {
+  return (
+    /^[A-Za-z_][A-Za-z0-9_]*=/.test(token) &&
+    (bare === undefined || /^1+$/.test(bare.slice(0, token.indexOf('=') + 1)))
+  );
+}
+
+function stripCommandPrefixes(words: string[], bares: string[]): string[] {
+  let start = 0;
+  while (words[start] && isEnvAssignmentToken(words[start]!, bares[start])) {
+    start++;
+  }
+  while (words[start] === 'command' || words[start] === 'builtin') {
+    let next = start + 1;
+    if (words[start] === 'command') {
+      while (/^-p+$/.test(words[next] ?? '')) next++;
+    }
+    if (words[next] === '--') {
+      next++;
+    } else if (words[next]?.startsWith('-')) {
+      // In particular, `command -v/-V` describes a command without running it.
+      break;
+    }
+    start = next;
+  }
+  // Words and character marks stay index-parallel through prefix removal.
+  const prefixes = words.splice(0, start);
+  bares.splice(0, start);
+  return prefixes;
 }
 
 /**
@@ -402,8 +585,13 @@ function looksLikePath(s: string): boolean {
   if (s.startsWith('-')) return false;
   // Pure integers — likely a count/size/mode argument (e.g. -n 10, chmod 755)
   if (/^\d+$/.test(s)) return false;
-  // Script-like expressions (awk/sed programs, brace expansions)
-  if (s.includes('{') || s.includes('}')) return false;
+  // Quoted awk/sed programs are not brace-expanded path arguments.
+  if (s.includes('{') || s.includes('}')) {
+    const bare = fragmentBare(s);
+    if (!s.split('').some((ch, index) => ch === '{' && bare?.[index] === '1')) {
+      return false;
+    }
+  }
   // URLs are handled separately by the web-fetch handlers
   if (s.includes('://')) return false;
   return true;
@@ -414,8 +602,8 @@ function looksLikePath(s: string): boolean {
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface RedirectResult {
-  readFiles: string[];
-  writeFiles: string[];
+  readFiles: ShellOperation[];
+  writeFiles: ShellOperation[];
 }
 
 /**
@@ -481,7 +669,7 @@ function fdRedirectFile(word: string): string | undefined {
  * Extract I/O redirections from a token array.
  *
  * Modifies `tokens` in-place to remove redirect operators and their targets.
- * Returns the absolute paths of redirect targets as read / write operations.
+ * Retains redirect operations and their path uncertainty before normalization.
  *
  * Handles:
  *   `> file`   `>> file`  `< file`   (with or without space)
@@ -500,9 +688,24 @@ function extractRedirects(
   fdCloses: ReadonlySet<number> = new Set(),
   bares?: string[],
 ): RedirectResult {
-  const readFiles: string[] = [];
-  const writeFiles: string[] = [];
+  const readFiles: ShellOperation[] = [];
+  const writeFiles: ShellOperation[] = [];
   const toRemove = new Set<number>();
+  const pushRedirect = (
+    virtualTool: 'read_file' | 'write_file',
+    target: string,
+    bare?: string,
+  ): void => {
+    const operation: ShellOperation = {
+      virtualTool,
+      filePath: resolvePath(target, cwd, bare),
+    };
+    // Keep uncertainty before `..` normalization can remove its source word.
+    if (isUncertainPath(target, bare)) {
+      operation.pathUnknown = true;
+    }
+    (virtualTool === 'read_file' ? readFiles : writeFiles).push(operation);
+  };
 
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i]!;
@@ -543,8 +746,10 @@ function extractRedirects(
         ? `&${tok.slice(fdOp.length)}`
         : fdRedirectFile(tok.slice(fdOp.length));
       if (file !== undefined) {
-        (fdOp === '<&' ? readFiles : writeFiles).push(
-          resolvePath(file, cwd, tokBare?.slice(fdOp.length)),
+        pushRedirect(
+          fdOp === '<&' ? 'read_file' : 'write_file',
+          file,
+          tokBare?.slice(fdOp.length),
         );
       }
       continue;
@@ -561,9 +766,9 @@ function extractRedirects(
       syntax === '1>|'
     ) {
       const target = tokens[i + 1];
-      if (target && looksLikePath(target)) {
+      if (target) {
         if (!isNetworkPseudoDevice(target)) {
-          writeFiles.push(resolvePath(target, cwd, targetBare(i + 1)));
+          pushRedirect('write_file', target, targetBare(i + 1));
         }
         toRemove.add(i);
         toRemove.add(i + 1);
@@ -571,9 +776,9 @@ function extractRedirects(
       }
     } else if (syntax === '>>' || syntax === '1>>') {
       const target = tokens[i + 1];
-      if (target && looksLikePath(target)) {
+      if (target) {
         if (!isNetworkPseudoDevice(target)) {
-          writeFiles.push(resolvePath(target, cwd, targetBare(i + 1)));
+          pushRedirect('write_file', target, targetBare(i + 1));
         }
         toRemove.add(i);
         toRemove.add(i + 1);
@@ -587,9 +792,9 @@ function extractRedirects(
       }
     } else if (syntax === '<') {
       const target = tokens[i + 1];
-      if (target && looksLikePath(target)) {
+      if (target) {
         if (!isNetworkPseudoDevice(target)) {
-          readFiles.push(resolvePath(target, cwd, targetBare(i + 1)));
+          pushRedirect('read_file', target, targetBare(i + 1));
         }
         toRemove.add(i);
         toRemove.add(i + 1);
@@ -605,12 +810,8 @@ function extractRedirects(
       // stderr / combined redirect — consume target
       const target = tokens[i + 1];
       if (target) {
-        if (
-          target !== '/dev/null' &&
-          looksLikePath(target) &&
-          !isNetworkPseudoDevice(target)
-        ) {
-          writeFiles.push(resolvePath(target, cwd, targetBare(i + 1)));
+        if (target !== '/dev/null' && !isNetworkPseudoDevice(target)) {
+          pushRedirect('write_file', target, targetBare(i + 1));
         }
         toRemove.add(i);
         toRemove.add(i + 1);
@@ -626,8 +827,10 @@ function extractRedirects(
       if (fdOp) {
         const file = fdRedirectFile(redirectText.slice(fdOp.length));
         if (file !== undefined) {
-          (fdOp === '<&' ? readFiles : writeFiles).push(
-            resolvePath(file, cwd, redirectBare?.slice(fdOp.length)),
+          pushRedirect(
+            fdOp === '<&' ? 'read_file' : 'write_file',
+            file,
+            redirectBare?.slice(fdOp.length),
           );
         }
         tokens[i] = tok.slice(0, split);
@@ -655,17 +858,12 @@ function extractRedirects(
           }
           continue;
         }
-        if (
-          target !== '/dev/null' &&
-          looksLikePath(target) &&
-          !isNetworkPseudoDevice(target)
-        ) {
-          const file = resolvePath(target, cwd, tokBare?.slice(targetStart));
-          if (op === '<') {
-            readFiles.push(file);
-          } else {
-            writeFiles.push(file);
-          }
+        if (target !== '/dev/null' && !isNetworkPseudoDevice(target)) {
+          pushRedirect(
+            op === '<' ? 'read_file' : 'write_file',
+            target,
+            tokBare?.slice(targetStart),
+          );
         }
         if (split > 0) {
           tokens[i] = tok.slice(0, split);
@@ -778,21 +976,34 @@ function getFlagValue(
 
 function targetDirectoryPath(args: string[], cwd: string): string | undefined {
   const target = getFlagValue(args, '-t', '--target-directory');
-  if (!target || !looksLikePath(target)) return undefined;
-  return resolvePath(target, cwd);
+  if (!target) return undefined;
+  return resolvePath(target, cwd, fragmentBare(target));
 }
 
 function targetDirectoryWrites(
   targetDir: string,
   sources: string[],
 ): ShellOperation[] {
-  return sources.map((source) => ({
-    virtualTool: 'write_file',
-    filePath: nodePath.posix.join(
-      targetDir,
-      nodePath.posix.basename(source.replace(/\\/g, '/')),
-    ),
-  }));
+  return sources.map((source) => {
+    const base = nodePath.posix.basename(source.replace(/\\/g, '/'));
+    const operation: ShellOperation = {
+      virtualTool: 'write_file',
+      filePath: nodePath.posix.join(targetDir, base),
+    };
+    // The destination inherits uncertainty from both halves: an expanded
+    // `-t out/$D` and a globbed source basename each make it unknowable. The
+    // resolved directory is matched back to its source word, because
+    // normalization can drop the very characters that carried the mark.
+    const dirBare = resolvedFragmentBare(targetDir);
+    if (
+      (dirBare !== undefined && dirBare.includes('2')) ||
+      isUncertainPath(targetDir, dirBare) ||
+      isUncertainPath(base, fragmentBare(base))
+    ) {
+      operation.pathUnknown = true;
+    }
+    return operation;
+  });
 }
 
 function writeOpForFlag(
@@ -802,8 +1013,8 @@ function writeOpForFlag(
   longName: string,
 ): ShellOperation | undefined {
   const target = getFlagValue(args, shortName, longName);
-  if (!target || !looksLikePath(target)) return undefined;
-  return { virtualTool: 'write_file', filePath: resolvePath(target, cwd) };
+  if (!target) return undefined;
+  return pathOperation('write_file', target, cwd);
 }
 
 function hasCombinedShortFlag(arg: string, flag: string): boolean {
@@ -836,10 +1047,7 @@ function readOps(
 ): ShellOperation[] {
   return getPositionalArgs(args, flagsWithValue)
     .filter(looksLikePath)
-    .map((p) => ({
-      virtualTool: 'read_file' as const,
-      filePath: resolvePath(p, cwd),
-    }));
+    .map((p) => pathOperation('read_file', p, cwd));
 }
 
 /** Build list_directory operations from positional path arguments.
@@ -852,10 +1060,7 @@ function listOps(
   const dirs = getPositionalArgs(args, flagsWithValue).filter(looksLikePath);
   if (dirs.length === 0)
     return [{ virtualTool: 'list_directory', filePath: cwd }];
-  return dirs.map((p) => ({
-    virtualTool: 'list_directory' as const,
-    filePath: resolvePath(p, cwd),
-  }));
+  return dirs.map((p) => pathOperation('list_directory', p, cwd));
 }
 
 /** Extract URL domain and return a web_fetch operation, or null on failure. */
@@ -1276,10 +1481,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     const tool: 'read_file' | 'list_directory' = isRecursive
       ? 'list_directory'
       : 'read_file';
-    return filePaths.map((p) => ({
-      virtualTool: tool,
-      filePath: resolvePath(p, cwd),
-    }));
+    return filePaths.map((p) => pathOperation(tool, p, cwd));
   },
   egrep: (a, d) => (COMMANDS['grep'] as CommandHandler)(a, d),
   fgrep: (a, d) => (COMMANDS['grep'] as CommandHandler)(a, d),
@@ -1316,10 +1518,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
       looksLikePath,
     );
     const filePaths = hasPatternFlag ? positional : positional.slice(1);
-    return filePaths.map((p) => ({
-      virtualTool: 'list_directory' as const,
-      filePath: resolvePath(p, cwd),
-    }));
+    return filePaths.map((p) => pathOperation('list_directory', p, cwd));
   },
 
   ag: (args, cwd) => {
@@ -1341,10 +1540,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
       looksLikePath,
     );
     const filePaths = hasPatternFlag ? positional : positional.slice(1);
-    return filePaths.map((p) => ({
-      virtualTool: 'list_directory' as const,
-      filePath: resolvePath(p, cwd),
-    }));
+    return filePaths.map((p) => pathOperation('list_directory', p, cwd));
   },
 
   ack: (args, cwd) => {
@@ -1363,10 +1559,9 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     const positional = getPositionalArgs(args, flagsWithValue).filter(
       looksLikePath,
     );
-    return positional.slice(1).map((p) => ({
-      virtualTool: 'list_directory' as const,
-      filePath: resolvePath(p, cwd),
-    }));
+    return positional
+      .slice(1)
+      .map((p) => pathOperation('list_directory', p, cwd));
   },
 
   // ── Directory-listing commands ────────────────────────────────────────────
@@ -1482,7 +1677,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
         expressionKeywords.has(arg)
       )
         break;
-      if (looksLikePath(arg)) startingPoints.push(resolvePath(arg, cwd));
+      if (looksLikePath(arg)) startingPoints.push(arg);
     }
     if (startingPoints.length === 0) {
       return [
@@ -1491,10 +1686,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
       ];
     }
     return [
-      ...startingPoints.map((p) => ({
-        virtualTool: 'list_directory' as const,
-        filePath: p,
-      })),
+      ...startingPoints.map((p) => pathOperation('list_directory', p, cwd)),
       ...extractFindExecOps(args, cwd),
     ];
   },
@@ -1549,34 +1741,22 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
       new Set(['-t', '-r', '--reference', '--date', '-d', '--time']),
     )
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'write_file' as const,
-        filePath: resolvePath(p, cwd),
-      })),
+      .map((p) => pathOperation('write_file', p, cwd)),
 
   mkdir: (args, cwd) =>
     getPositionalArgs(args, new Set(['-m', '--mode', '-Z', '--context']))
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'write_file' as const,
-        filePath: resolvePath(p, cwd),
-      })),
+      .map((p) => pathOperation('write_file', p, cwd)),
 
   mkfifo: (args, cwd) =>
     getPositionalArgs(args, new Set(['-m', '--mode', '-Z']))
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'write_file' as const,
-        filePath: resolvePath(p, cwd),
-      })),
+      .map((p) => pathOperation('write_file', p, cwd)),
 
   tee: (args, cwd) =>
     getPositionalArgs(args)
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'write_file' as const,
-        filePath: resolvePath(p, cwd),
-      })),
+      .map((p) => pathOperation('write_file', p, cwd)),
 
   cp: (args, cwd) => {
     const targetDir = targetDirectoryPath(args, cwd);
@@ -1599,29 +1779,18 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     if (positional.length === 0) return [];
     if (targetDir) {
       return [
-        ...positional.map((p) => ({
-          virtualTool: 'read_file' as const,
-          filePath: resolvePath(p, cwd),
-        })),
+        ...positional.map((p) => pathOperation('read_file', p, cwd)),
         ...targetDirectoryWrites(targetDir, positional),
       ];
     }
     if (positional.length === 1) {
-      return [
-        {
-          virtualTool: 'read_file',
-          filePath: resolvePath(positional[0]!, cwd),
-        },
-      ];
+      return [pathOperation('read_file', positional[0]!, cwd)];
     }
     const srcs = positional.slice(0, -1);
     const dst = positional[positional.length - 1]!;
     return [
-      ...srcs.map((p) => ({
-        virtualTool: 'read_file' as const,
-        filePath: resolvePath(p, cwd),
-      })),
-      { virtualTool: 'write_file' as const, filePath: resolvePath(dst, cwd) },
+      ...srcs.map((p) => pathOperation('read_file', p, cwd)),
+      pathOperation('write_file', dst, cwd),
     ];
   },
 
@@ -1641,10 +1810,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     );
     if (targetDir && positional.length > 0) {
       return [
-        ...positional.map((p) => ({
-          virtualTool: 'edit' as const,
-          filePath: resolvePath(p, cwd),
-        })),
+        ...positional.map((p) => pathOperation('edit', p, cwd)),
         ...targetDirectoryWrites(targetDir, positional),
       ];
     }
@@ -1653,11 +1819,8 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     const dst = positional[positional.length - 1]!;
     return [
       // The source files are edited (moved away — their original location changes)
-      ...srcs.map((p) => ({
-        virtualTool: 'edit' as const,
-        filePath: resolvePath(p, cwd),
-      })),
-      { virtualTool: 'write_file' as const, filePath: resolvePath(dst, cwd) },
+      ...srcs.map((p) => pathOperation('edit', p, cwd)),
+      pathOperation('write_file', dst, cwd),
     ];
   },
 
@@ -1686,10 +1849,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     );
     if (targetDir && positional.length > 0) {
       return [
-        ...positional.map((p) => ({
-          virtualTool: 'read_file' as const,
-          filePath: resolvePath(p, cwd),
-        })),
+        ...positional.map((p) => pathOperation('read_file', p, cwd)),
         ...targetDirectoryWrites(targetDir, positional),
       ];
     }
@@ -1697,11 +1857,8 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     const srcs = positional.slice(0, -1);
     const dst = positional[positional.length - 1]!;
     return [
-      ...srcs.map((p) => ({
-        virtualTool: 'read_file' as const,
-        filePath: resolvePath(p, cwd),
-      })),
-      { virtualTool: 'write_file', filePath: resolvePath(dst, cwd) },
+      ...srcs.map((p) => pathOperation('read_file', p, cwd)),
+      pathOperation('write_file', dst, cwd),
     ];
   },
 
@@ -1712,15 +1869,12 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
       if (arg.startsWith('if=')) {
         const p = arg.slice(3);
         if (looksLikePath(p)) {
-          ops.push({ virtualTool: 'read_file', filePath: resolvePath(p, cwd) });
+          ops.push(pathOperation('read_file', p, cwd));
         }
       } else if (arg.startsWith('of=')) {
         const p = arg.slice(3);
         if (looksLikePath(p)) {
-          ops.push({
-            virtualTool: 'write_file',
-            filePath: resolvePath(p, cwd),
-          });
+          ops.push(pathOperation('write_file', p, cwd));
         }
       }
     }
@@ -1744,21 +1898,13 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     ).filter(looksLikePath);
     if (positional.length === 0) return [];
     if (positional.length === 1) {
-      return [
-        {
-          virtualTool: 'read_file',
-          filePath: resolvePath(positional[0]!, cwd),
-        },
-      ];
+      return [pathOperation('read_file', positional[0]!, cwd)];
     }
     const srcs = positional.slice(0, -1);
     const dst = positional[positional.length - 1]!;
     return [
-      ...srcs.map((p) => ({
-        virtualTool: 'read_file' as const,
-        filePath: resolvePath(p, cwd),
-      })),
-      { virtualTool: 'write_file' as const, filePath: resolvePath(dst, cwd) },
+      ...srcs.map((p) => pathOperation('read_file', p, cwd)),
+      pathOperation('write_file', dst, cwd),
     ];
   },
 
@@ -1771,10 +1917,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     ).filter(looksLikePath);
     if (targetDir && positional.length > 0) {
       return [
-        ...positional.map((p) => ({
-          virtualTool: 'read_file' as const,
-          filePath: resolvePath(p, cwd),
-        })),
+        ...positional.map((p) => pathOperation('read_file', p, cwd)),
         ...targetDirectoryWrites(targetDir, positional),
       ];
     }
@@ -1782,11 +1925,8 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     const targets = positional.slice(0, -1);
     const linkname = positional[positional.length - 1]!;
     return [
-      ...targets.map((p) => ({
-        virtualTool: 'read_file' as const,
-        filePath: resolvePath(p, cwd),
-      })),
-      { virtualTool: 'write_file', filePath: resolvePath(linkname, cwd) },
+      ...targets.map((p) => pathOperation('read_file', p, cwd)),
+      pathOperation('write_file', linkname, cwd),
     ];
   },
 
@@ -1795,10 +1935,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
   rm: (args, cwd) =>
     getPositionalArgs(args, new Set(['--interactive']))
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'edit' as const,
-        filePath: resolvePath(p, cwd),
-      })),
+      .map((p) => pathOperation('edit', p, cwd)),
 
   rmdir: (args, cwd) =>
     getPositionalArgs(
@@ -1806,18 +1943,12 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
       new Set(['--ignore-fail-on-non-empty', '-p', '--parents']),
     )
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'edit' as const,
-        filePath: resolvePath(p, cwd),
-      })),
+      .map((p) => pathOperation('edit', p, cwd)),
 
   unlink: (args, cwd) =>
     getPositionalArgs(args)
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'edit' as const,
-        filePath: resolvePath(p, cwd),
-      })),
+      .map((p) => pathOperation('edit', p, cwd)),
 
   shred: (args, cwd) =>
     getPositionalArgs(
@@ -1825,10 +1956,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
       new Set(['-n', '--iterations', '-s', '--size', '--random-source']),
     )
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'edit' as const,
-        filePath: resolvePath(p, cwd),
-      })),
+      .map((p) => pathOperation('edit', p, cwd)),
 
   truncate: (args, cwd) =>
     getPositionalArgs(
@@ -1846,10 +1974,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
       ]),
     )
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'edit' as const,
-        filePath: resolvePath(p, cwd),
-      })),
+      .map((p) => pathOperation('edit', p, cwd)),
 
   chmod: (args, cwd) => {
     // chmod [opts] MODE file... — the mode is the first positional arg.
@@ -1862,10 +1987,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     return positional
       .slice(1)
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'edit' as const,
-        filePath: resolvePath(p, cwd),
-      }));
+      .map((p) => pathOperation('edit', p, cwd));
   },
 
   chown: (args, cwd) => {
@@ -1877,10 +1999,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     return positional
       .slice(1)
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'edit' as const,
-        filePath: resolvePath(p, cwd),
-      }));
+      .map((p) => pathOperation('edit', p, cwd));
   },
 
   chgrp: (args, cwd) => {
@@ -1888,32 +2007,18 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     return positional
       .slice(1)
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: 'edit' as const,
-        filePath: resolvePath(p, cwd),
-      }));
+      .map((p) => pathOperation('edit', p, cwd));
   },
 
   rename: (args, cwd) => {
     // rename FROM TO file... — skip first two positionals (the from/to patterns)
     const positional = getPositionalArgs(args).filter(looksLikePath);
-    return positional.slice(2).map((p) => ({
-      virtualTool: 'edit' as const,
-      filePath: resolvePath(p, cwd),
-    }));
+    return positional.slice(2).map((p) => pathOperation('edit', p, cwd));
   },
 
   patch: (args, cwd) => {
     const output = getFlagValue(args, '-o', '--output');
-    const outputOps =
-      output && looksLikePath(output)
-        ? [
-            {
-              virtualTool: 'edit' as const,
-              filePath: resolvePath(output, cwd),
-            },
-          ]
-        : [];
+    const outputOps = output ? [pathOperation('edit', output, cwd)] : [];
 
     return [
       ...outputOps,
@@ -1922,10 +2027,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
         new Set(['-i', '--input', '-d', '--directory', '-o', '--output']),
       )
         .filter(looksLikePath)
-        .map((p) => ({
-          virtualTool: 'edit' as const,
-          filePath: resolvePath(p, cwd),
-        })),
+        .map((p) => pathOperation('edit', p, cwd)),
     ];
   },
 
@@ -1951,10 +2053,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     ).filter(looksLikePath);
     const files = hasExplicitScript ? positional : positional.slice(1);
     const tool: 'edit' | 'read_file' = hasInPlace ? 'edit' : 'read_file';
-    return files.map((p) => ({
-      virtualTool: tool,
-      filePath: resolvePath(p, cwd),
-    }));
+    return files.map((p) => pathOperation(tool, p, cwd));
   },
 
   sed: (args, cwd) => {
@@ -1995,10 +2094,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     // Otherwise, the first positional is the script expression.
     const filePaths = hasExplicitScript ? positional : positional.slice(1);
     const tool: 'edit' | 'read_file' = hasInPlace ? 'edit' : 'read_file';
-    return filePaths.map((p) => ({
-      virtualTool: tool,
-      filePath: resolvePath(p, cwd),
-    }));
+    return filePaths.map((p) => pathOperation(tool, p, cwd));
   },
 
   awk: (args, cwd) => {
@@ -2040,10 +2136,7 @@ const COMMANDS: Readonly<Record<string, CommandHandler>> = {
     const tool: 'edit' | 'read_file' = hasInPlace ? 'edit' : 'read_file';
     return getPositionalArgs(args, flagsWithValue)
       .filter(looksLikePath)
-      .map((p) => ({
-        virtualTool: tool,
-        filePath: resolvePath(p, cwd),
-      }));
+      .map((p) => pathOperation(tool, p, cwd));
   },
   gawk: (a, d) => (COMMANDS['awk'] as CommandHandler)(a, d),
 
@@ -2307,17 +2400,17 @@ export function extractShellOperations(
   const { readFiles: redirectReads, writeFiles: redirectWrites } =
     extractRedirects(tokens, cwd, fdRedirects, fdCloses, bares);
 
-  while (tokens[0] && isEnvAssignmentToken(tokens[0])) {
-    tokens.shift();
-  }
+  stripCommandPrefixes(tokens, bares);
 
   const cmdName = tokens[0];
   if (!cmdName) {
     // Only assignments and/or redirections were present.
-    return toRedirectOperations({
-      readFiles: redirectReads,
-      writeFiles: redirectWrites,
-    });
+    return markUndecodablePathOps(
+      toRedirectOperations({
+        readFiles: redirectReads,
+        writeFiles: redirectWrites,
+      }),
+    );
   }
 
   const ops: ShellOperation[] = [];
@@ -2368,7 +2461,8 @@ export function extractShellOperations(
     const handler = COMMANDS[cmdName];
     if (handler) {
       const args = tokens.slice(1);
-      ops.push(...handler(args, cwd));
+      const argBares = bares.slice(1);
+      ops.push(...dispatchHandler(handler, args, cwd, argBares));
     }
     // Unknown commands: return no ops (safe — we don't guess what we don't know)
   }
@@ -2381,7 +2475,7 @@ export function extractShellOperations(
     }),
   );
 
-  return ops;
+  return markUndecodablePathOps(ops);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2434,6 +2528,7 @@ function resolveCdTargetCwd(
   // extractRedirects compacts `words` and `bares` together, so the target and
   // its marking are read from the filtered arrays.
   const redirects = extractRedirects(words, cwd, fdRedirects, fdCloses, bares);
+  const prefixes = stripCommandPrefixes(words, bares);
 
   if (words[0] === 'popd') return { kind: 'dynamic', redirects };
   if (words[0] !== 'cd' && words[0] !== 'pushd') return { kind: 'not-cd' };
@@ -2463,6 +2558,14 @@ function resolveCdTargetCwd(
   if (!target || target === '-' || isDynamicShellPath(target)) {
     return { kind: 'dynamic', redirects };
   }
+  if (
+    (words[targetIndex] === undefined &&
+      prefixes.some((prefix) => prefix.startsWith('HOME='))) ||
+    (!isShellAbsolutePath(target) &&
+      prefixes.some((prefix) => prefix.startsWith('CDPATH=')))
+  ) {
+    return { kind: 'dynamic', redirects };
+  }
   const targetBare = bares[targetIndex];
   // A target the shell had to decode (`cd $'\x7e'` is the literal directory
   // `~`, never $HOME) may not exist at all — bash then fails the cd and the
@@ -2481,7 +2584,10 @@ function resolveCdTargetCwd(
   return {
     kind: 'static',
     cwd: resolvePath(target, cwd, targetBare),
-    cwdUnknown: targetIsDecoded || (cwdUnknown && !isShellAbsolutePath(target)),
+    cwdUnknown:
+      targetIsDecoded ||
+      isUncertainPath(target, targetBare) ||
+      (cwdUnknown && !isShellAbsolutePath(target)),
     redirects,
   };
 }
@@ -2490,16 +2596,15 @@ function toRedirectOperations({
   readFiles,
   writeFiles,
 }: RedirectResult): ShellOperation[] {
-  return [
-    ...readFiles.map((filePath) => ({
-      virtualTool: 'read_file' as const,
-      filePath,
-    })),
-    ...writeFiles.map((filePath) => ({
-      virtualTool: 'write_file' as const,
-      filePath,
-    })),
-  ];
+  return [...readFiles, ...writeFiles];
+}
+
+function markUndecodablePathOps(ops: ShellOperation[]): ShellOperation[] {
+  return ops.map((op) =>
+    op.filePath && hasUnpairedSurrogate(op.filePath)
+      ? { ...op, pathUnknown: true }
+      : op,
+  );
 }
 
 /**
@@ -2541,7 +2646,7 @@ export function extractShellOperationsAcrossCommand(
   command: string,
   cwd: string,
 ): ShellOperation[] {
-  return walkCompoundCommand(command, cwd, 0, false);
+  return markUndecodablePathOps(walkCompoundCommand(command, cwd, 0, false));
 }
 
 function extractFindExecOps(args: string[], cwd: string): ShellOperation[] {
