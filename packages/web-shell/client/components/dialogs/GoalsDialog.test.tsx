@@ -84,6 +84,21 @@ function findButton(label: string): HTMLButtonElement | undefined {
   );
 }
 
+/** Compose a budget progressbar's accessible name from the visible nodes its
+ * aria-labelledby references — the name must be the rendered label + figure
+ * themselves, not a duplicated aria-label string. */
+function barName(testid: string): string {
+  const bar = document.querySelector(`[data-testid="${testid}"]`);
+  if (!bar) throw new Error(`bar not found: ${testid}`);
+  const ids = (bar.getAttribute('aria-labelledby') ?? '')
+    .split(/\s+/)
+    .filter(Boolean);
+  expect(ids).toHaveLength(2);
+  return ids
+    .map((id) => document.getElementById(id)?.textContent ?? '')
+    .join(': ');
+}
+
 /** Set the condition textarea the way React's onChange expects. */
 function setTextarea(value: string) {
   const textarea = document.querySelector('textarea');
@@ -279,12 +294,12 @@ describe('GoalsDialog', () => {
         activeTimeBudgetMs: 1_800_000,
       }),
     ]);
-    expect(
-      document.querySelector('[data-testid="goal-turns"]')?.textContent,
-    ).toBe('3 / 20 turns');
-    expect(
-      document.querySelector('[data-testid="goal-elapsed"]')?.textContent,
-    ).toBe('12m 3s / 30m 0s');
+    // Armed budgets state their figures once, in the progress row; the
+    // matching footer cells are suppressed so the card never repeats them.
+    expect(barName('goal-budget-turns')).toBe('Turns: 3 / 20 turns');
+    expect(barName('goal-budget-time')).toBe('Active time: 12m 3s / 30m 0s');
+    expect(document.querySelector('[data-testid="goal-turns"]')).toBeNull();
+    expect(document.querySelector('[data-testid="goal-elapsed"]')).toBeNull();
   });
 
   it('keeps usage without budgets unchanged', async () => {
@@ -299,7 +314,7 @@ describe('GoalsDialog', () => {
     ).toBe('12m 3s');
   });
 
-  it('hides unused budgets', async () => {
+  it('renders zero-progress rows for armed budgets before any spend', async () => {
     await mount([
       withSpend({
         status: 'paused',
@@ -310,17 +325,24 @@ describe('GoalsDialog', () => {
       }),
     ]);
     expect(
-      document.querySelector('[data-testid="goal-turns"]')?.textContent,
-    ).not.toContain('/');
+      document
+        .querySelector('[data-testid="goal-budget-turns"]')
+        ?.getAttribute('aria-valuenow'),
+    ).toBe('0');
+    expect(
+      document
+        .querySelector('[data-testid="goal-budget-time"]')
+        ?.getAttribute('aria-valuenow'),
+    ).toBe('0');
+    expect(document.querySelector('[data-testid="goal-turns"]')).toBeNull();
     expect(document.querySelector('[data-testid="goal-elapsed"]')).toBeNull();
   });
 
   it('shows spend against the budget once a turn has billed', async () => {
     await mount([withSpend({ tokensUsed: 1_234, tokenBudget: 30_000_000 })]);
 
-    expect(
-      document.querySelector('[data-testid="goal-tokens"]')?.textContent,
-    ).toBe('1.2k / 30.0M tokens');
+    expect(barName('goal-budget-tokens')).toBe('Tokens: 1.2k / 30.0M tokens');
+    expect(document.querySelector('[data-testid="goal-tokens"]')).toBeNull();
   });
 
   it('shows spend alone when the Goal has no budget', async () => {
@@ -331,9 +353,14 @@ describe('GoalsDialog', () => {
     ).toBe('1.2k tokens');
   });
 
-  it('shows nothing for a Goal that has not billed a turn', async () => {
+  it('renders a zero token row when a budget is armed but nothing billed', async () => {
     await mount([withSpend({ tokensUsed: 0, tokenBudget: 30_000_000 })]);
 
+    expect(
+      document
+        .querySelector('[data-testid="goal-budget-tokens"]')
+        ?.getAttribute('aria-valuenow'),
+    ).toBe('0');
     expect(document.querySelector('[data-testid="goal-tokens"]')).toBeNull();
   });
 
@@ -342,6 +369,122 @@ describe('GoalsDialog', () => {
     await mount([baseGoal()]);
 
     expect(document.querySelector('[data-testid="goal-tokens"]')).toBeNull();
+  });
+
+  describe('budget progress bars', () => {
+    it('renders a bar for each armed budget', async () => {
+      await mount([
+        withSpend({
+          status: 'paused',
+          turnCount: 3,
+          turnBudget: 20,
+          tokensUsed: 5_000_000,
+          tokenBudget: 20_000_000,
+          activeTimeMs: 600_000,
+          activeTimeBudgetMs: 1_800_000,
+        }),
+      ]);
+
+      const turns = document.querySelector('[data-testid="goal-budget-turns"]');
+      const tokens = document.querySelector(
+        '[data-testid="goal-budget-tokens"]',
+      );
+      const time = document.querySelector('[data-testid="goal-budget-time"]');
+      expect(turns?.getAttribute('aria-valuenow')).toBe('15');
+      expect(tokens?.getAttribute('aria-valuenow')).toBe('25');
+      expect(time?.getAttribute('aria-valuenow')).toBe('33');
+      expect(barName('goal-budget-turns')).toBe('Turns: 3 / 20 turns');
+      expect(barName('goal-budget-tokens')).toBe('Tokens: 5.0M / 20.0M tokens');
+      expect(barName('goal-budget-time')).toBe('Active time: 10m 0s / 30m 0s');
+      // The inline width is the visual readout; aria alone would stay green
+      // with every bar rendered empty or full. jsdom does no layout, so pin
+      // the inline style, not a computed pixel width.
+      expect(
+        document.querySelector<HTMLElement>(
+          '[data-testid="goal-budget-turns"] > div',
+        )?.style.width,
+      ).toBe('15%');
+      expect(
+        document.querySelector<HTMLElement>(
+          '[data-testid="goal-budget-tokens"] > div',
+        )?.style.width,
+      ).toBe('25%');
+      expect(
+        document.querySelector<HTMLElement>(
+          '[data-testid="goal-budget-time"] > div',
+        )?.style.width,
+      ).toBe('33%');
+    });
+
+    it("states an armed budget's figures exactly once on the card", async () => {
+      // Removing the footer suppression must turn this red: the row and the
+      // footer would both print the same localised figure. The row must also
+      // exist and carry the figure itself — otherwise "row deleted, footer
+      // took over" would keep the count at one and pass vacuously.
+      await mount([withSpend({ turnCount: 3, turnBudget: 20 })]);
+
+      const card = document.querySelector('[role="listitem"]')!;
+      const row = card.querySelector('[data-testid="goal-budget-turns"]');
+      expect(row).not.toBeNull();
+      const rowText = row!.closest('[class*="budgetRow"]')?.textContent ?? '';
+      expect(rowText).toContain('3 / 20 turns');
+      const occurrences =
+        (card.textContent ?? '').split('3 / 20 turns').length - 1;
+      expect(occurrences).toBe(1);
+      expect(document.querySelector('[data-testid="goal-turns"]')).toBeNull();
+    });
+
+    it('renders no bars when no budget is armed', async () => {
+      await mount([baseGoal()]);
+
+      expect(
+        document.querySelector('[data-testid="goal-budget-turns"]'),
+      ).toBeNull();
+      expect(
+        document.querySelector('[data-testid="goal-budget-tokens"]'),
+      ).toBeNull();
+      expect(
+        document.querySelector('[data-testid="goal-budget-time"]'),
+      ).toBeNull();
+    });
+
+    it('skips the token bar when the daemon reports no spend', async () => {
+      // A budget without a usage figure cannot attest zero spend.
+      await mount([withSpend({ tokenBudget: 20_000_000 })]);
+
+      expect(
+        document.querySelector('[data-testid="goal-budget-tokens"]'),
+      ).toBeNull();
+    });
+
+    it('clamps a spent budget to a full bar', async () => {
+      await mount([
+        withSpend({ status: 'usage_limited', turnCount: 25, turnBudget: 20 }),
+      ]);
+
+      expect(
+        document
+          .querySelector('[data-testid="goal-budget-turns"]')
+          ?.getAttribute('aria-valuenow'),
+      ).toBe('100');
+      expect(
+        document.querySelector<HTMLElement>(
+          '[data-testid="goal-budget-turns"] > div',
+        )?.style.width,
+      ).toBe('100%');
+    });
+
+    it('tones the fill by lifecycle state', async () => {
+      await mount([
+        withSpend({ status: 'paused', turnCount: 3, turnBudget: 20 }),
+      ]);
+
+      expect(
+        document
+          .querySelector('[data-testid="goal-budget-turns"] > div')
+          ?.getAttribute('data-status'),
+      ).toBe('attention');
+    });
   });
 
   const stopped = (
@@ -469,6 +612,115 @@ describe('GoalsDialog', () => {
     click(findButton('fix-ci'));
 
     expect(onOpenSession).toHaveBeenCalledWith('sess-1', undefined);
+  });
+
+  it('opens the goal session from the header action', async () => {
+    const onOpenSession = vi.fn();
+    await mount([baseGoal()], { onOpenSession });
+
+    click(document.querySelector('[data-testid="goal-open-session"]'));
+
+    expect(onOpenSession).toHaveBeenCalledWith('sess-1', undefined);
+  });
+
+  it('renders the session link as a labeled navigation affordance', async () => {
+    await mount([baseGoal()]);
+
+    const link = document.querySelector('[data-testid="goal-session-link"]');
+    expect(link).not.toBeNull();
+    expect(link!.textContent).toContain('fix-ci');
+    // Message icon + arrow icon frame the name so it reads as a jump, not a
+    // label; the grey text-only shape was indistinguishable from the meta.
+    expect(link!.querySelectorAll('svg')).toHaveLength(2);
+  });
+
+  it('keeps the header session action enabled while a control is in flight', async () => {
+    // Navigation is not a control: the busy gate that locks edit/pause/clear
+    // must never lock the jump to the session. Gating it would strand the
+    // user on the Goals page for the whole duration of a slow control.
+    const onOpenSession = vi.fn();
+    await mount([baseGoal()], { onOpenSession });
+    let release: (() => void) | undefined;
+    actions.controlGoal.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve({ snapshot: { v: 2, activity: 'idle', goal: null } });
+        }),
+    );
+
+    click(document.querySelector('button[aria-label="Clear goal"]'));
+    await flush();
+    expect(
+      document.querySelector<HTMLButtonElement>(
+        'button[aria-label="Clear goal"]',
+      )?.disabled,
+    ).toBe(true);
+
+    const jump = document.querySelector<HTMLButtonElement>(
+      '[data-testid="goal-open-session"]',
+    );
+    expect(jump?.disabled).toBe(false);
+    click(jump);
+    expect(onOpenSession).toHaveBeenCalledWith('sess-1', undefined);
+
+    await act(async () => {
+      release?.();
+      await Promise.resolve();
+    });
+    await flush();
+  });
+
+  it('opens the goal session in its tagged workspace from the header action', async () => {
+    const onOpenSession = vi.fn();
+    await mount([], {
+      workspaces: [
+        { id: 'ws-1', cwd: '/w-primary', primary: true, trusted: true },
+        { id: 'ws-2', cwd: '/w-secondary', primary: false, trusted: true },
+      ],
+      listGoalsByWorkspace: {
+        '': { goals: [baseGoal()], droppedCount: 0 },
+        'ws-2': { goals: [], droppedCount: 0 },
+      },
+      onOpenSession,
+    });
+
+    click(document.querySelector('[data-testid="goal-open-session"]'));
+
+    expect(onOpenSession).toHaveBeenCalledWith('sess-1', '/w-primary');
+  });
+
+  it('tones the status pill by lifecycle state', async () => {
+    const statuses = [
+      'active',
+      'paused',
+      'blocked',
+      'usage_limited',
+      'complete',
+    ] as const;
+    const tones = ['running', 'attention', 'attention', 'attention', 'done'];
+    // Distinct descending setAt values keep the merged list in this order.
+    await mount(
+      statuses.map((status, index) => {
+        const goal = baseGoal({
+          sessionId: `sess-${index}`,
+          setAt: 1000 - index,
+        });
+        return {
+          ...goal,
+          snapshot: {
+            ...goal.snapshot,
+            goal: { ...goal.snapshot.goal, status },
+          },
+        };
+      }),
+    );
+
+    const pills = document.querySelectorAll('[data-testid="goal-status"]');
+    expect(pills).toHaveLength(statuses.length);
+    statuses.forEach((_, index) => {
+      expect(pills[index].getAttribute('data-status')).toBe(tones[index]);
+    });
   });
 
   it('clears a goal immediately and reloads the list', async () => {

@@ -85,6 +85,109 @@ test('aggregates goals from every workspace and badges each card @smoke', async 
   expect(paths).toContain('GET /workspaces/ws-secondary/goals');
 });
 
+test('opening a goal from the card header loads its session @smoke', async ({
+  page,
+  baseURL,
+}) => {
+  await openGoals(page, baseURL!, multiWorkspaceOverrides);
+
+  const secondaryCard = page
+    .locator('[role="listitem"]')
+    .filter({ hasText: 'secondary goal' });
+  const pillColor = await secondaryCard
+    .getByTestId('goal-status')
+    .evaluate((el) => getComputedStyle(el).color);
+  await secondaryCard.getByTestId('goal-open-session').click();
+
+  // The transcript IS the goal's history: the header action must land on the
+  // owning session's route and leave the Goals page.
+  await page.waitForURL('**/session/sess-secondary**');
+  await expect(page.getByTestId('goals-page')).toHaveCount(0);
+
+  // The strip's lifecycle tint must actually be painted and read the same
+  // state as the card it came from: deleting the strip's [data-status]
+  // colour rule falls back to plain foreground and goes red here.
+  const strip = page.getByTestId('goal-status-strip');
+  await expect(strip).toBeVisible();
+  const [stripStatusColor, stripActivityColor] = await strip.evaluate(
+    (root) => {
+      const status = root.querySelector('[data-status]') as HTMLElement;
+      const activity = root.querySelector('[class*="activity"]') as HTMLElement;
+      return [getComputedStyle(status).color, getComputedStyle(activity).color];
+    },
+  );
+  expect(stripStatusColor).toBe(pillColor);
+  expect(stripStatusColor).not.toBe(stripActivityColor);
+});
+
+test('a stopped goal shows its lifecycle tone and budget progress @smoke', async ({
+  page,
+  baseURL,
+}) => {
+  const base = goalSnapshot('budgeted goal', 1_000);
+  await openGoals(page, baseURL!, {
+    goalSnapshot: {
+      ...base,
+      goal: {
+        ...base.goal,
+        status: 'paused' as const,
+        turnCount: 3,
+        turnBudget: 20,
+      },
+    },
+  });
+
+  await expect(page.getByTestId('goal-status')).toHaveAttribute(
+    'data-status',
+    'attention',
+  );
+  const turnsBar = page.getByTestId('goal-budget-turns');
+  await expect(turnsBar).toHaveAttribute('aria-valuenow', '15');
+  // Real-browser proof the fill actually renders at the ratio: aria alone
+  // would stay green with an empty bar. The fill is 15% of its track.
+  const widths = await turnsBar.evaluate((track) => {
+    const fill = track.firstElementChild as HTMLElement;
+    return {
+      track: track.getBoundingClientRect().width,
+      fill: fill.getBoundingClientRect().width,
+    };
+  });
+  expect(widths.track).toBeGreaterThan(0);
+  expect(Math.abs(widths.fill - widths.track * 0.15)).toBeLessThan(1);
+
+  // The tint and the link cue must actually be painted: reverting the link
+  // to the meta grey or deleting a [data-status] colour rule has to go red.
+  const [fillBg, trackBg, linkColor, metaColor, pillColor, pillBg] =
+    await turnsBar.evaluate((track) => {
+      const fill = track.firstElementChild as HTMLElement;
+      const link = document.querySelector(
+        '[data-testid="goal-session-link"]',
+      ) as HTMLElement;
+      const meta = document.querySelector(
+        '[data-testid="goal-activity"]',
+      ) as HTMLElement;
+      const pill = document.querySelector(
+        '[data-testid="goal-status"]',
+      ) as HTMLElement;
+      return [
+        getComputedStyle(fill).backgroundColor,
+        getComputedStyle(track).backgroundColor,
+        getComputedStyle(link).color,
+        getComputedStyle(meta).color,
+        getComputedStyle(pill).color,
+        getComputedStyle(pill).backgroundColor,
+      ];
+    });
+  expect(fillBg).not.toBe(trackBg);
+  expect(fillBg).not.toBe('rgba(0, 0, 0, 0)');
+  expect(linkColor).not.toBe(metaColor);
+  // The paused fill and the pill read the same attention token; deleting
+  // either [data-status] rule makes them diverge. The pill background must
+  // also differ from the plain muted track (its base colour).
+  expect(fillBg).toBe(pillColor);
+  expect(pillBg).not.toBe(trackBg);
+});
+
 test('the create form targets the picked workspace @smoke', async ({
   page,
   baseURL,

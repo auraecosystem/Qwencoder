@@ -29542,6 +29542,48 @@ describe('App session callbacks', () => {
     expect(activeGoals.at(-1)).toBeNull();
   });
 
+  it('offers the strip Goals-page affordance when project features are available', async () => {
+    mockConnection.goalState = activeGoalSnapshot();
+    const { container } = renderApp();
+    await flush();
+
+    expect(
+      container.querySelector('[data-testid="goal-status-strip"]'),
+    ).not.toBeNull();
+    const openGoals = container.querySelector<HTMLButtonElement>(
+      '[data-testid="goal-open-goals"]',
+    );
+    expect(openGoals).not.toBeNull();
+    // Rendering is not enough: the button must be bound to the real Goals
+    // navigation, not a no-op. A `() => {}` mutant survives a presence-only
+    // assertion and ships a dead button.
+    await act(async () => {
+      openGoals!.click();
+      await flush();
+    });
+    expect(
+      container.querySelector('[data-testid="goals-page"]'),
+    ).not.toBeNull();
+  });
+
+  it('hides the strip Goals-page affordance when project features are unavailable', async () => {
+    // The Goals page renders under the same gate; offering the button where
+    // the page cannot open would navigate nowhere.
+    mockWorkspace.capabilities = {
+      workspaces: [],
+    } as typeof mockWorkspace.capabilities;
+    mockConnection.goalState = activeGoalSnapshot();
+    const { container } = renderApp();
+    await flush();
+
+    expect(
+      container.querySelector('[data-testid="goal-status-strip"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="goal-open-goals"]'),
+    ).toBeNull();
+  });
+
   it('refuses /language ui while a Goal owns the session', async () => {
     // The daemon sync is what makes the agent answer in the new language; if
     // it is skipped the chrome switches alone and the agent keeps replying in
