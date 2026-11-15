@@ -257,7 +257,7 @@ const execFileAsync = promisify(execFile);
 // the class with a controllable mock; each worktree test sets
 // `mockWt.impl` to control instance behaviour.
 const mockWt = vi.hoisted(() => ({
-  impl: undefined as (() => Record<string, unknown>) | undefined,
+  impl: undefined as ((cwd?: string) => Record<string, unknown>) | undefined,
   createMarker: undefined as
     | ((...args: unknown[]) => Promise<unknown>)
     | undefined,
@@ -336,9 +336,9 @@ vi.mock(
         static validateUserWorktreeSlug =
           original.GitWorktreeService.validateUserWorktreeSlug;
         static generateAutoSlug = original.GitWorktreeService.generateAutoSlug;
-        constructor() {
+        constructor(cwd?: string) {
           if (mockWt.impl) {
-            Object.assign(this, mockWt.impl());
+            Object.assign(this, mockWt.impl(cwd));
           }
         }
       },
@@ -421,7 +421,7 @@ vi.mock('./server/git-branch-ops.js', () => ({
   getHeadCommit: () =>
     mockBranchOps.getHeadCommit
       ? mockBranchOps.getHeadCommit()
-      : Promise.resolve(undefined),
+      : Promise.resolve('a'.repeat(40)),
   createBranch: () =>
     mockBranchOps.createBranch
       ? mockBranchOps.createBranch()
@@ -843,6 +843,8 @@ const EXPECTED_STAGE1_FEATURES = [
   'workspace_session_metadata',
   'session_worktree_persistence_v1',
   'session_worktree_reset_v1',
+  'session_worktree_branch_v1',
+  'session_worktree_handoff_v1',
   // Baseline (always advertised) — presence means the `/voice/stream`
   // endpoint exists; the WS errors if no voice model is configured.
   'voice_transcribe',
@@ -955,6 +957,8 @@ const EXPECTED_REGISTERED_FEATURES = [
       f !== 'workspace_session_metadata' &&
       f !== 'session_worktree_persistence_v1' &&
       f !== 'session_worktree_reset_v1' &&
+      f !== 'session_worktree_branch_v1' &&
+      f !== 'session_worktree_handoff_v1' &&
       f !== 'voice_transcribe' &&
       f !== 'realtime_voice' &&
       f !== 'realtime_voice_web',
@@ -1037,6 +1041,8 @@ const EXPECTED_REGISTERED_FEATURES = [
   'workspace_session_metadata',
   'session_worktree_persistence_v1',
   'session_worktree_reset_v1',
+  'session_worktree_branch_v1',
+  'session_worktree_handoff_v1',
   'workspace_qualified_acp',
   'client_mcp_over_ws',
   'cdp_tunnel_over_ws',
@@ -15752,11 +15758,13 @@ describe('createServeApp', () => {
         undefined,
         { bridge },
       );
+      // Mirror the real detached contract: createUserWorktree returns
+      // branch:'' when detached, never the slug-derived name.
       const mockCreate = vi.fn().mockResolvedValue({
         success: true,
         worktree: {
           path: worktreePath,
-          branch: 'worktree-my-task',
+          branch: '',
         },
       });
       mockWt.impl = () => ({
@@ -15767,6 +15775,8 @@ describe('createServeApp', () => {
       mockWt.realpath = (p) => p;
       mockWt.createMarker = createMarker;
       mockWt.writeSidecar = writeSidecar;
+      const baseCommit = 'b'.repeat(40);
+      mockBranchOps.getHeadCommit = () => Promise.resolve(baseCommit);
 
       try {
         const res = await request(app)
@@ -15778,7 +15788,7 @@ describe('createServeApp', () => {
         expect(res.body.worktree).toEqual({
           slug: 'my-task',
           path: worktreePath,
-          branch: 'worktree-my-task',
+          branch: '',
         });
         expect(res.body.worktreeState).toBe('persisted-v1');
         expect(bridge.calls[0]?.sessionScope).toBe('thread');
@@ -15787,24 +15797,61 @@ describe('createServeApp', () => {
         expect(bridge.changeSessionCwdCalls[0]?.allowedRoots).toEqual([
           path.join(WS_BOUND, '.qwen', 'worktrees'),
         ]);
-        expect(mockCreate).toHaveBeenCalledWith('my-task', 'main');
+        expect(mockCreate).toHaveBeenCalledWith('my-task', 'main', {
+          carryDirtyState: true,
+          detached: true,
+        });
         expect(createMarker).toHaveBeenCalledWith(worktreePath, 'fake-0');
+        // The sidecar must record the base the worktree starts from:
+        // handoff back to local promotes a branch only when HEAD moved
+        // past originalHeadCommit, so an empty base would silently skip
+        // the promotion and leave the agent's commits in the worktree.
         expect(writeSidecar).toHaveBeenCalledWith(
           expect.stringMatching(/fake-0\.worktree\.json$/),
           {
             slug: 'my-task',
             worktreePath,
-            worktreeBranch: 'worktree-my-task',
+            worktreeBranch: '',
             originalCwd: WS_BOUND,
             workspaceCwd: WS_BOUND,
-            originalBranch: '',
-            originalHeadCommit: '',
+            originalBranch: 'main',
+            originalHeadCommit: baseCommit,
+            worktreeBase: baseCommit,
           },
         );
       } finally {
+        mockBranchOps.getHeadCommit = undefined;
         mockWt.createMarker = undefined;
         mockWt.writeSidecar = undefined;
         mockWt.realpath = undefined;
+        mockWt.impl = undefined;
+      }
+    });
+
+    it('409 when the workspace has no commits to base a worktree on', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+      mockWt.impl = () => ({
+        isGitRepository: () => Promise.resolve(true),
+        getCurrentBranch: () => Promise.resolve('main'),
+      });
+      mockBranchOps.getHeadCommit = () => Promise.resolve(undefined);
+
+      try {
+        const res = await request(app)
+          .post('/session')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ worktree: { slug: 'my-task' } });
+
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe('worktree_base_unavailable');
+        expect(bridge.calls).toHaveLength(0);
+      } finally {
+        mockBranchOps.getHeadCommit = undefined;
         mockWt.impl = undefined;
       }
     });
@@ -29412,7 +29459,6 @@ describe('createServeApp', () => {
       );
       const slug = 'branch-test';
       const worktreePath = path.join(repo, '.qwen', 'worktrees', slug);
-      const worktreeBranch = `worktree-${slug}`;
       try {
         await execFileAsync('git', ['init', '-b', 'main'], { cwd: repo });
         await execFileAsync('git', ['config', 'commit.gpgsign', 'false'], {
@@ -29443,28 +29489,25 @@ describe('createServeApp', () => {
         });
         const baseCommit = stdout.trim();
         mockBranchOps.getHeadCommit = async () => baseCommit;
+        const createWorktreeCalls: unknown[][] = [];
         mockWt.impl = () => ({
           isGitRepository: async () => true,
           getRepoTopLevel: async () => repo,
           getCurrentBranch: async () => 'main',
           getUserWorktreePath: () => worktreePath,
-          createUserWorktree: async () => {
+          // Mirror the real detached contract: createUserWorktree returns
+          // branch:'' when detached, never the slug-derived name.
+          createUserWorktree: async (...args: unknown[]) => {
+            createWorktreeCalls.push(args);
             await fsp.mkdir(path.dirname(worktreePath), { recursive: true });
             await execFileAsync(
               'git',
-              [
-                'worktree',
-                'add',
-                '-b',
-                worktreeBranch,
-                worktreePath,
-                baseCommit,
-              ],
+              ['worktree', 'add', '--detach', worktreePath, baseCommit],
               { cwd: repo },
             );
             return {
               success: true,
-              worktree: { slug, path: worktreePath, branch: worktreeBranch },
+              worktree: { slug, path: worktreePath, branch: '' },
             };
           },
         });
@@ -29552,8 +29595,25 @@ describe('createServeApp', () => {
           sessionId: expect.any(String),
           workspaceCwd: repo,
           currentCwd: worktreePath,
-          worktree: { slug, path: worktreePath, branch: worktreeBranch },
+          worktree: { slug, path: worktreePath, branch: '' },
         });
+        // The dirty capture must target the session's own checkout, not
+        // the placement root; dropping dirtyStateSource silently captures
+        // the main checkout's edits for a session living elsewhere. The
+        // route realpaths the field, so mirror that here (macOS tmpdir is
+        // symlinked: /var → /private/var).
+        expect(createWorktreeCalls[0]).toEqual([
+          slug,
+          baseCommit,
+          expect.objectContaining({
+            carryDirtyState: true,
+            detached: true,
+            dirtyStateSource: realpathSync(repo),
+            // The branch route persists carriedPaths in the journal, so it
+            // bounds the carry (CARRIED_PATHS_MAX_BYTES = 32 KiB).
+            maxCarriedPathsBytes: 32 * 1024,
+          }),
+        ]);
         expect(res.body.sourceWarnings).toEqual([
           'Session sources could not be copied.',
         ]);
@@ -29581,9 +29641,18 @@ describe('createServeApp', () => {
           `${res.body.sessionId}.worktree.json`,
         );
         expect(existsSync(sidecarPath)).toBe(true);
+        // The detached convention: the sidecar must record '', not the
+        // slug-derived branch — a named record would surface much later as
+        // a permanent 409 worktree_branch_mismatch on handoff. worktreeBase
+        // records the creation base (here equal to the repo top's HEAD).
         expect(
           JSON.parse(await fsp.readFile(sidecarPath, 'utf8')),
-        ).toMatchObject({ workspaceCwd: repo });
+        ).toMatchObject({
+          workspaceCwd: repo,
+          worktreeBranch: '',
+          originalHeadCommit: baseCommit,
+          worktreeBase: baseCommit,
+        });
         expect(
           existsSync(
             path.join(chatsDir, `.branch-worktree-${res.body.sessionId}.json`),
@@ -29599,6 +29668,352 @@ describe('createServeApp', () => {
         expect(
           await fsp.readFile(path.join(worktreePath, '.qwen-session'), 'utf8'),
         ).toBe(res.body.sessionId);
+        expect(
+          (await fsp.readdir(chatsDir)).filter((entry) =>
+            entry.startsWith('.branch-worktree-'),
+          ),
+        ).toEqual([]);
+      } finally {
+        mockWt.impl = undefined;
+        mockBranchOps.getHeadCommit = undefined;
+        await fsp.rm(repo, { recursive: true, force: true });
+        await fsp.rm(runtimeDir, { recursive: true, force: true });
+      }
+    });
+
+    it('records the source checkout HEAD as worktreeBase when it diverges from the repo top (R5-4)', async () => {
+      const repo = await fsp.mkdtemp(
+        path.join(os.tmpdir(), 'qwen-branch-diverge-repo-'),
+      );
+      const runtimeDir = await fsp.mkdtemp(
+        path.join(os.tmpdir(), 'qwen-branch-diverge-runtime-'),
+      );
+      const slug = 'branch-diverge';
+      const worktreePath = path.join(repo, '.qwen', 'worktrees', slug);
+      const siblingPath = path.join(repo, '.qwen', 'worktrees', 'sibling');
+      try {
+        await execFileAsync('git', ['init', '-b', 'main'], { cwd: repo });
+        await execFileAsync('git', ['config', 'commit.gpgsign', 'false'], {
+          cwd: repo,
+        });
+        await execFileAsync(
+          'git',
+          ['config', 'core.hooksPath', path.join(repo, '.git', 'empty-hooks')],
+          { cwd: repo },
+        );
+        await fsp.writeFile(path.join(repo, 'README.md'), 'base\n', 'utf8');
+        await execFileAsync('git', ['add', 'README.md'], { cwd: repo });
+        await execFileAsync(
+          'git',
+          [
+            '-c',
+            'user.name=Qwen Test',
+            '-c',
+            'user.email=qwen@example.com',
+            'commit',
+            '-m',
+            'base',
+          ],
+          { cwd: repo },
+        );
+        const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+          cwd: repo,
+        });
+        const rootHead = stdout.trim();
+        // The source session lives in a sibling managed worktree that
+        // committed ahead of the repo top. The branch worktree is created
+        // at the SIBLING's HEAD, while originalHeadCommit must keep
+        // describing the repo top for the handoff's local_head_moved gate.
+        await execFileAsync(
+          'git',
+          ['worktree', 'add', '--detach', siblingPath, rootHead],
+          { cwd: repo },
+        );
+        await fsp.writeFile(path.join(siblingPath, 'ahead.txt'), 'ahead\n');
+        await execFileAsync('git', ['add', 'ahead.txt'], { cwd: siblingPath });
+        await execFileAsync(
+          'git',
+          [
+            '-c',
+            'user.name=Qwen Test',
+            '-c',
+            'user.email=qwen@example.com',
+            'commit',
+            '-m',
+            'sibling work',
+          ],
+          { cwd: siblingPath },
+        );
+        const { stdout: siblingStdout } = await execFileAsync(
+          'git',
+          ['rev-parse', 'HEAD'],
+          { cwd: siblingPath },
+        );
+        const siblingHead = siblingStdout.trim();
+        expect(siblingHead).not.toBe(rootHead);
+        await fsp.writeFile(
+          path.join(siblingPath, '.qwen-session'),
+          'source-session',
+          'utf8',
+        );
+        const chatsDir = path.join(
+          new Storage(repo, runtimeDir).getProjectDir(),
+          'chats',
+        );
+        await fsp.mkdir(chatsDir, { recursive: true });
+        await fsp.writeFile(
+          path.join(chatsDir, 'source-session.worktree.json'),
+          JSON.stringify({
+            slug: 'sibling',
+            worktreePath: siblingPath,
+            worktreeBranch: '',
+            originalCwd: repo,
+            workspaceCwd: repo,
+            originalBranch: 'main',
+            originalHeadCommit: rootHead,
+          }),
+          'utf8',
+        );
+        // The repo-top HEAD read (the handoff gate base) stays the root's.
+        mockBranchOps.getHeadCommit = async () => rootHead;
+        mockWt.readSidecar = async (filePath: unknown) => {
+          try {
+            return JSON.parse(await fsp.readFile(String(filePath), 'utf8'));
+          } catch {
+            return null;
+          }
+        };
+        const createWorktreeCalls: unknown[][] = [];
+        mockWt.impl = (cwd?: string) => ({
+          isGitRepository: async () => true,
+          // The mock must distinguish the two checkouts: flattening them
+          // would hide the very divergence under test. Compare canonical
+          // paths on both sides — macOS's default TMPDIR is a /var ->
+          // /private/var symlink, so the raw mkdtemp siblingPath would
+          // never equal the realpath'd cwd there.
+          getRepoTopLevel: async () =>
+            cwd !== undefined && realpathSync(cwd) === realpathSync(siblingPath)
+              ? siblingPath
+              : repo,
+          getCurrentBranch: async () => 'main',
+          getUserWorktreePath: () => worktreePath,
+          createUserWorktree: async (...args: unknown[]) => {
+            createWorktreeCalls.push(args);
+            await fsp.mkdir(path.dirname(worktreePath), { recursive: true });
+            await execFileAsync(
+              'git',
+              ['worktree', 'add', '--detach', worktreePath, String(args[1])],
+              { cwd: repo },
+            );
+            return {
+              success: true,
+              worktree: { slug, path: worktreePath, branch: '' },
+            };
+          },
+        });
+        const bridge = fakeBridge({
+          summaryImpl: (sessionId) => {
+            if (sessionId !== 'source-session') {
+              throw new SessionNotFoundError(sessionId);
+            }
+            return {
+              sessionId,
+              workspaceCwd: repo,
+              createdAt: '2026-08-16T00:00:00.000Z',
+              clientCount: 1,
+              hasActivePrompt: false,
+            };
+          },
+        });
+        bridge.getSessionExecutionSnapshot = () => ({
+          workspaceCwd: repo,
+          effectiveCwd: siblingPath,
+          worktree: { slug: 'sibling', path: siblingPath, branch: '' },
+        });
+        bridge.branchSession = vi.fn(
+          async (
+            _sourceSessionId: string,
+            branchRequest: { targetSessionId?: string },
+          ) => ({
+            sessionId: branchRequest.targetSessionId!,
+            displayName: 'Worktree branch',
+            forkedFrom: {
+              sessionId: 'source-session',
+              displayName: 'Source',
+            },
+            sourceWarnings: [],
+          }),
+        );
+        const runtime = makeWorkspaceRuntimeForTest({
+          workspaceId: 'branch-worktree-primary',
+          workspaceCwd: repo,
+          sessionRuntimeBaseDir: runtimeDir,
+          primary: true,
+          bridge,
+        });
+        const app = createServeApp(
+          { ...baseOpts, workspace: repo },
+          undefined,
+          { workspaceRegistry: createWorkspaceRegistry([runtime]) },
+        );
+
+        const res = await request(app)
+          .post('/session/source-session/branch')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ worktree: { slug } });
+
+        expect(res.status).toBe(201);
+        // The worktree was created at the source checkout's HEAD.
+        expect(createWorktreeCalls[0]?.[1]).toBe(siblingHead);
+        const { stdout: wtHead } = await execFileAsync(
+          'git',
+          ['rev-parse', 'HEAD'],
+          { cwd: worktreePath },
+        );
+        expect(wtHead.trim()).toBe(siblingHead);
+        const sidecar = JSON.parse(
+          await fsp.readFile(
+            path.join(chatsDir, `${res.body.sessionId}.worktree.json`),
+            'utf8',
+          ),
+        );
+        // originalHeadCommit keeps describing originalCwd's checkout (the
+        // repo top); worktreeBase records the creation base. Swapping the
+        // two re-breaks the return handoff, exit_worktree and the reaper.
+        expect(sidecar.originalHeadCommit).toBe(rootHead);
+        expect(sidecar.worktreeBase).toBe(siblingHead);
+        expect(sidecar.originalCwd).toBe(repo);
+      } finally {
+        mockWt.impl = undefined;
+        mockWt.readSidecar = undefined;
+        mockBranchOps.getHeadCommit = undefined;
+        await fsp.rm(repo, { recursive: true, force: true });
+        await fsp.rm(runtimeDir, { recursive: true, force: true });
+      }
+    });
+
+    it('forwards the carried overlay to the rollback when the bridge fails', async () => {
+      const repo = await fsp.mkdtemp(
+        path.join(os.tmpdir(), 'qwen-branch-carry-repo-'),
+      );
+      const runtimeDir = await fsp.mkdtemp(
+        path.join(os.tmpdir(), 'qwen-branch-carry-runtime-'),
+      );
+      const slug = 'branch-carry';
+      const worktreePath = path.join(repo, '.qwen', 'worktrees', slug);
+      try {
+        await execFileAsync('git', ['init', '-b', 'main'], { cwd: repo });
+        await execFileAsync('git', ['config', 'commit.gpgsign', 'false'], {
+          cwd: repo,
+        });
+        await fsp.writeFile(path.join(repo, 'README.md'), 'base\n', 'utf8');
+        await execFileAsync('git', ['add', 'README.md'], { cwd: repo });
+        await execFileAsync(
+          'git',
+          [
+            '-c',
+            'user.name=Qwen Test',
+            '-c',
+            'user.email=qwen@example.com',
+            'commit',
+            '-m',
+            'base',
+          ],
+          { cwd: repo },
+        );
+        // The source checkout is dirty; the overlay the creation reports
+        // must reach the rollback through the journal, or the rollback
+        // refuses its own carried files and strands the worktree.
+        await fsp.writeFile(path.join(repo, 'dirty.txt'), 'dirty\n', 'utf8');
+        const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+          cwd: repo,
+        });
+        const baseCommit = stdout.trim();
+        mockBranchOps.getHeadCommit = async () => baseCommit;
+        const removeCalls: unknown[][] = [];
+        mockWt.impl = () => ({
+          isGitRepository: async () => true,
+          getRepoTopLevel: async () => repo,
+          getCurrentBranch: async () => 'main',
+          getUserWorktreePath: () => worktreePath,
+          createUserWorktree: async () => {
+            await fsp.mkdir(path.dirname(worktreePath), { recursive: true });
+            await execFileAsync(
+              'git',
+              ['worktree', 'add', '--detach', worktreePath, baseCommit],
+              { cwd: repo },
+            );
+            return {
+              success: true,
+              worktree: { slug, path: worktreePath, branch: '' },
+              carriedPaths: ['dirty.txt'],
+            };
+          },
+          removePreparedUserWorktree: async (...args: unknown[]) => {
+            removeCalls.push(args);
+            // Honor the journal-advance callback, then reap the checkout.
+            await (args[3] as () => Promise<void>)();
+            await fsp.rm(worktreePath, { recursive: true, force: true });
+            return { success: true };
+          },
+        });
+        const bridge = fakeBridge({
+          summaryImpl: (sessionId) => {
+            if (sessionId !== 'source-session') {
+              throw new SessionNotFoundError(sessionId);
+            }
+            return {
+              sessionId,
+              workspaceCwd: repo,
+              createdAt: '2026-08-16T00:00:00.000Z',
+              clientCount: 1,
+              hasActivePrompt: false,
+            };
+          },
+        });
+        bridge.getSessionExecutionSnapshot = () => ({
+          workspaceCwd: repo,
+          effectiveCwd: repo,
+        });
+        // A settled pre-commit refusal: after mutation dispatch, only
+        // settled failures run the prepared-worktree cleanup (a generic
+        // error could mean the branch exists on the bridge).
+        bridge.branchSession = vi
+          .fn()
+          .mockRejectedValue(new SessionBusyError('source-session'));
+        const runtime = makeWorkspaceRuntimeForTest({
+          workspaceId: 'branch-worktree-primary',
+          workspaceCwd: repo,
+          sessionRuntimeBaseDir: runtimeDir,
+          primary: true,
+          bridge,
+        });
+        const app = createServeApp(
+          { ...baseOpts, workspace: repo },
+          undefined,
+          { workspaceRegistry: createWorkspaceRegistry([runtime]) },
+        );
+
+        const res = await request(app)
+          .post('/session/source-session/branch')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ worktree: { slug } });
+
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe('session_busy');
+        expect(removeCalls).toHaveLength(1);
+        // (slug, owner, base, onRemoved, branchOwned, carriedPaths): the
+        // overlay must be forwarded, and the detached preparation owns no
+        // branch.
+        expect(removeCalls[0][0]).toBe(slug);
+        expect(removeCalls[0][2]).toBe(baseCommit);
+        expect(removeCalls[0][4]).toBe(false);
+        expect(removeCalls[0][5]).toEqual(['dirty.txt']);
+        expect(existsSync(worktreePath)).toBe(false);
+        const chatsDir = path.join(
+          new Storage(repo, runtimeDir).getProjectDir(),
+          'chats',
+        );
         expect(
           (await fsp.readdir(chatsDir)).filter((entry) =>
             entry.startsWith('.branch-worktree-'),

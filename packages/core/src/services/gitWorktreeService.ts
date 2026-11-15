@@ -13,7 +13,7 @@ import { execFile, execSync } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
-import type { SimpleGit } from 'simple-git';
+import type { SimpleGit, SimpleGitOptions } from 'simple-git';
 import { Storage } from '../config/storage.js';
 import { isCommandAvailable } from '../utils/shell-utils.js';
 import { isNodeError } from '../utils/errors.js';
@@ -37,6 +37,42 @@ export function worktreeBranchForSlug(slug: string): string {
 }
 
 /**
+ * The bare branch name from a `rev-parse --symbolic-full-name HEAD` answer.
+ * `--abbrev-ref` qualifies a short name as `heads/<name>` when a same-named
+ * tag (or other ref) makes it ambiguous, which would never equal the bare
+ * name recorded in the sidecar; the full ref is namespace-independent, so
+ * stripping the fixed `refs/heads/` prefix recovers the exact branch name
+ * even for a branch literally named `heads/foo`. A detached HEAD reports
+ * `HEAD`, which is returned unchanged for the caller to interpret.
+ */
+function bareBranchName(symbolicRef: string): string {
+  return symbolicRef.startsWith('refs/heads/')
+    ? symbolicRef.slice('refs/heads/'.length)
+    : symbolicRef;
+}
+
+/**
+ * Error detection for the dirty-carry `stash apply` calls. simple-git's
+ * default treats a non-zero exit as an error only when stderr is non-empty
+ * (`exitCode && stdErr.length`); a git apply that fails with an empty
+ * stderr — observed on the CI fleet's git build, where a held index lock /
+ * read-only git directory made the apply exit non-zero yet resolve — would
+ * otherwise leave `applyError` unset and record a carry that never landed.
+ * Judge by the real process exit status so any non-zero exit surfaces,
+ * regardless of which stream git reported on.
+ */
+export const carryApplyErrorDetection: NonNullable<
+  SimpleGitOptions['errors']
+> = (error, result) => {
+  if (error) return error;
+  if (result.exitCode === 0) return undefined;
+  const message = Buffer.concat([...result.stdOut, ...result.stdErr])
+    .toString('utf8')
+    .trim();
+  return new Error(message || `git apply exited with code ${result.exitCode}`);
+};
+
+/**
  * Filename of the in-worktree session marker. Created at worktree
  * provisioning time and consulted by `exit_worktree` to decide
  * whether the current session is allowed to drop the worktree. Marker
@@ -46,10 +82,54 @@ export function worktreeBranchForSlug(slug: string): string {
 export const WORKTREE_SESSION_FILE = '.qwen-session';
 const WORKTREE_SESSION_MARKER_MAX_BYTES = 512;
 
+/**
+ * Upper bound on the serialized carried-overlay path list. The branch
+ * preparation journal persists `carriedPaths` and its reader refuses
+ * records above 64 KiB (`BRANCH_WORKTREE_JOURNAL_MAX_BYTES`); an overlay
+ * too large to record would make every later phase transition — including
+ * the rollback's own — throw, stranding the worktree and its journal.
+ * Half the journal cap leaves room for the rest of the record. Overlays
+ * above the bound are not carried (fail-open to committed state), keeping
+ * every created worktree rollbackable.
+ */
+export const CARRIED_PATHS_MAX_BYTES = 32 * 1024;
+
+/** Root-level staged marker siblings (`.qwen-session.<hex>.tmp`), matching
+ * the anchored info/exclude rule. */
+const WORKTREE_SESSION_TMP_PATTERN = new RegExp(
+  `^${WORKTREE_SESSION_FILE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.[^/]*\\.tmp$`,
+);
+
 export class WorktreeSessionMarkerOwnerChangedError extends Error {
   constructor() {
     super('Worktree session marker owner changed');
     this.name = 'WorktreeSessionMarkerOwnerChangedError';
+  }
+}
+
+/**
+ * The dirty carry's tracked snapshot could not be applied cleanly. Either
+ * it conflicted with the worktree base (a 3-way `stash apply` that wrote
+ * conflict markers and unmerged index entries, `conflict: true`) or it
+ * failed for an environment reason such as an unwritable index
+ * (`conflict: false`). The worktree is restored to committed state when
+ * `restoreFailed` is false; callers must not present the overlay as carried,
+ * and may distinguish a content conflict from an environment failure via
+ * `conflict`. When `restoreFailed` is true the restore itself failed (locked
+ * index, read-only git dir) and the worktree may still hold a half-applied
+ * overlay — a fail-open caller must NOT baseline it as committed user state.
+ */
+export class WorktreeDirtyCarryConflictError extends Error {
+  readonly conflict: boolean;
+  readonly restoreFailed: boolean;
+  constructor(
+    message: string,
+    options?: { conflict?: boolean; restoreFailed?: boolean },
+  ) {
+    super(message);
+    this.name = 'WorktreeDirtyCarryConflictError';
+    this.conflict = options?.conflict ?? true;
+    this.restoreFailed = options?.restoreFailed ?? false;
   }
 }
 
@@ -1008,6 +1088,12 @@ export interface CreateWorktreeResult {
   success: boolean;
   worktree?: WorktreeInfo;
   error?: string;
+  /**
+   * Repo-relative paths the dirty carry applied (tracked + untracked),
+   * present when carryDirtyState was requested. A prepared-worktree
+   * rollback exempts exactly these from its cleanliness gate.
+   */
+  carriedPaths?: string[];
 }
 
 export interface WorktreeSetupResult {
@@ -1372,6 +1458,425 @@ export class GitWorktreeService {
   }
 
   /**
+   * Snapshot the source checkout's uncommitted state without modifying its
+   * working tree or index: `git stash create` for tracked changes (staged +
+   * unstaged) plus the untracked file list. The untracked probe fails open
+   * (a capture problem degrades to committed-state-only worktrees), but a
+   * `stash create` FAILURE is reported via `captureError` rather than
+   * swallowed: a caller that relocates a session onto this overlay
+   * (`createUserWorktree({ carryDirtyState })`) must refuse rather than
+   * present an empty carry as complete. `captureError` is null when the
+   * stash succeeded or there was simply nothing to stash (a clean tree).
+   */
+  private async captureDirtyState(): Promise<{
+    stashCommit: string;
+    untrackedFiles: string[];
+    trackedFiles: string[];
+    removedPaths: string[];
+    repoTop: string;
+    captureError: string | null;
+  }> {
+    // NOTE: `git stash create` does NOT support --include-untracked;
+    // untracked files are handled separately via file copy.
+    let stashCommit = '';
+    let captureError: string | null = null;
+    try {
+      stashCommit = (await (await this.getGit()).stash(['create'])).trim();
+    } catch (error) {
+      // An environment failure (held index.lock, read-only git dir) is NOT
+      // "nothing to carry": record it so a carry-requesting caller refuses
+      // instead of moving the session without the user's tracked edits.
+      captureError = error instanceof Error ? error.message : String(error);
+    }
+    // The tracked paths the stash carries, so a rollback can exempt
+    // exactly the carried overlay from its cleanliness gate.
+    let trackedFiles: string[] = [];
+    if (stashCommit) {
+      try {
+        // --no-renames: a detected rename would collapse to its destination,
+        // hiding the deletion side from the rollback's exemption set; the
+        // applied overlay presents both sides (A new + D old), so the list
+        // must name both.
+        const raw = await (
+          await this.getGit()
+        ).raw([
+          'stash',
+          'show',
+          '--name-only',
+          '--no-renames',
+          '-z',
+          stashCommit,
+        ]);
+        trackedFiles = raw.split('\0').filter(Boolean);
+      } catch {
+        // Non-fatal: the rollback gate stays conservative.
+      }
+    }
+    // The service may be rooted at a subdirectory of the repository;
+    // --full-name keeps untracked paths repository-relative so the overlay
+    // lands them at the same offset inside the worktree. When the repo top
+    // cannot be resolved, skip the untracked overlay rather than pair
+    // repo-relative paths with a subdirectory base (every copy would miss
+    // and be swallowed); the tracked stash carry still applies.
+    const repoTop = await this.getRepoTopLevel().catch(() => null);
+    let untrackedFiles: string[] = [];
+    let removedPaths: string[] = [];
+    if (repoTop === null) {
+      debugLogger.warn(
+        'captureDirtyState: repository top unavailable; skipping untracked carry',
+      );
+    } else {
+      untrackedFiles = await this.listUntrackedFiles(repoTop);
+      removedPaths = await this.listDeletedToDirectory(repoTop);
+    }
+    return {
+      stashCommit,
+      untrackedFiles,
+      trackedFiles,
+      removedPaths,
+      repoTop: repoTop ?? this.sourceRepoPath,
+      captureError,
+    };
+  }
+
+  /**
+   * Repository-relative tracked paths deleted in the working tree whose
+   * path is now a DIRECTORY (the user moved a file into a folder of the
+   * same name). `git stash create` cannot represent this file→directory
+   * replacement — the stash omits the deletion and `stash show --name-only`
+   * names nothing — so the carry must remove the target's tracked file
+   * explicitly or it resurrects the file and the untracked directory
+   * content (which `listUntrackedFiles` does list) cannot land. Detected
+   * from `git status --porcelain -z` deletion entries whose path lstats as
+   * a directory; fail-open (an unreadable status yields no explicit removals).
+   */
+  private async listDeletedToDirectory(repoTop: string): Promise<string[]> {
+    let raw: string;
+    try {
+      const { simpleGit } = await loadSimpleGit();
+      raw = await simpleGit(repoTop)
+        .env(gitEnv())
+        .raw(['status', '--porcelain', '-z']);
+    } catch {
+      return [];
+    }
+    const removed: string[] = [];
+    for (const record of raw.split('\0')) {
+      // `XY <path>`: two status columns, a space, then the path. A rename
+      // emits a second bare-path record (no status prefix) which fails the
+      // shape check below and is skipped.
+      if (record.length < 4 || record[2] !== ' ') continue;
+      if (record[0] !== 'D' && record[1] !== 'D') continue;
+      const rel = record.slice(3);
+      if (rel.length === 0) continue;
+      const isDir = await fs
+        .lstat(path.join(repoTop, rel))
+        .then((st) => st.isDirectory())
+        .catch(() => false);
+      if (isDir) removed.push(rel);
+    }
+    return removed;
+  }
+
+  /**
+   * Raw repository-relative untracked paths. `-z` emits NUL-terminated
+   * records: without it git C-quotes non-ASCII (core.quotepath), quotes,
+   * and newlines, and the quoted text would reach copyFile as a literal
+   * name and be silently dropped. Never trim the records — leading and
+   * trailing spaces are legal filename characters. Run at the repository
+   * top, not the service root: from a subdirectory `ls-files --others`
+   * lists only that subtree, while the tracked half of the overlay
+   * (stash show) is repository-wide — the two halves must cover one set.
+   */
+  private async listUntrackedFiles(repoTop: string): Promise<string[]> {
+    try {
+      const { simpleGit } = await loadSimpleGit();
+      const raw = await simpleGit(repoTop)
+        .env(gitEnv())
+        .raw([
+          'ls-files',
+          '--others',
+          '--exclude-standard',
+          '--full-name',
+          '-z',
+        ]);
+      // Defense in depth: the daemon's own bookkeeping files are normally
+      // git-excluded, but if the exclude rule is missing (an upgraded or
+      // damaged checkout) they must not be carried as user content — a
+      // marker copied into another checkout is daemon residue, not work.
+      return raw
+        .split('\0')
+        .filter(
+          (rel) =>
+            rel.length > 0 &&
+            rel !== WORKTREE_SESSION_FILE &&
+            !WORKTREE_SESSION_TMP_PATTERN.test(rel),
+        );
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Copy one overlay entry, preserving symlinks as links. `copyFile`
+   * dereferences them: a link to a file would materialize out-of-repo
+   * content into the checkout (which a later `git add -A` could commit),
+   * and a link to a directory would fail EISDIR and vanish.
+   */
+  private async copyOverlayEntry(src: string, dst: string): Promise<void> {
+    const stat = await fs.lstat(src);
+    if (stat.isSymbolicLink()) {
+      await fs.symlink(await fs.readlink(src), dst);
+    } else {
+      await fs.copyFile(src, dst);
+    }
+  }
+
+  /**
+   * Copy one overlay entry into the target checkout with destination
+   * containment. Returns true only when the entry was CREATED. Skips (does
+   * not throw) when the destination already exists — a pre-existing file
+   * (e.g. a git-ignored secret the clean gate cannot see) must survive the
+   * carry — or when an ancestor symlink would redirect the write outside
+   * the target checkout (a committed `out -> <outside>` link): the deepest
+   * existing ancestor's realpath is checked BEFORE mkdir (which follows
+   * symlink ancestors), and the parent is re-verified after. Shared by both
+   * untracked-copy paths so neither can write outside the checkout.
+   */
+  private async copyOverlayEntryContained(
+    srcTop: string,
+    targetTop: string,
+    realTargetTop: string,
+    rel: string,
+  ): Promise<boolean> {
+    const dst = path.join(targetTop, rel);
+    const exists = await fs
+      .lstat(dst)
+      .then(() => true)
+      .catch(() => false);
+    if (exists) return false;
+    const parent = path.dirname(dst);
+    let ancestor = parent;
+    while (
+      !(await fs
+        .lstat(ancestor)
+        .then(() => true)
+        .catch(() => false))
+    ) {
+      const up = path.dirname(ancestor);
+      if (up === ancestor) break;
+      ancestor = up;
+    }
+    if (
+      !isWithinRoot(
+        await fs.realpath(ancestor).catch(() => ancestor),
+        realTargetTop,
+      )
+    ) {
+      return false;
+    }
+    await fs.mkdir(parent, { recursive: true });
+    if (
+      !isWithinRoot(
+        await fs.realpath(parent).catch(() => parent),
+        realTargetTop,
+      )
+    ) {
+      return false;
+    }
+    await this.copyOverlayEntry(path.join(srcTop, rel), dst);
+    return true;
+  }
+
+  /**
+   * Copy this checkout's untracked files into another checkout of the
+   * same repository at the same repository-relative offset (the target
+   * may be rooted at a subdirectory). Fail-open per file; a pre-existing
+   * destination is never overwritten, and an entry whose destination would
+   * escape the target checkout through an ancestor symlink is skipped.
+   * Returns the paths actually CREATED so a caller can undo the overlay on
+   * rollback without deleting files that were already there.
+   */
+  async carryUntrackedFilesTo(targetCwd: string): Promise<string[]> {
+    const repoTop = await this.getRepoTopLevel().catch(() => null);
+    if (repoTop === null) {
+      debugLogger.warn(
+        'carryUntrackedFilesTo: repository top unavailable; skipping',
+      );
+      return [];
+    }
+    const files = await this.listUntrackedFiles(repoTop);
+    if (files.length === 0) return [];
+    const targetTop =
+      (await new GitWorktreeService(targetCwd)
+        .getRepoTopLevel()
+        .catch(() => null)) ?? targetCwd;
+    const realTargetTop = await fs.realpath(targetTop).catch(() => targetTop);
+    const copied: string[] = [];
+    for (const rel of files) {
+      try {
+        // Only files this call CREATES are recorded for undo: the caller's
+        // rollback removes the returned paths, and a pre-existing file must
+        // survive the carry. Containment skips escaping ancestor symlinks.
+        if (
+          await this.copyOverlayEntryContained(
+            repoTop,
+            targetTop,
+            realTargetTop,
+            rel,
+          )
+        ) {
+          copied.push(rel);
+        }
+      } catch {
+        // Fail-open: skip files that can't be copied.
+      }
+    }
+    return copied;
+  }
+
+  /**
+   * Overlay a captured dirty state onto a worktree: apply the tracked
+   * changes and copy untracked files. A tracked apply that conflicts or
+   * fails for an environment reason restores the worktree to committed
+   * state and throws WorktreeDirtyCarryConflictError, so creation is refused
+   * rather than relocating the session without the user's work. The
+   * untracked half is independent and is carried even when the tracked apply
+   * failed, so a fail-open caller (setupWorktrees) still baselines the user's
+   * untracked work on top of committed state; the per-file copy stays
+   * fail-open and contained (no pre-existing overwrite, no ancestor-symlink
+   * escape).
+   */
+  private async applyDirtyState(
+    worktreePath: string,
+    dirtyState: {
+      stashCommit: string;
+      untrackedFiles: string[];
+      removedPaths: string[];
+      repoTop: string;
+    },
+  ): Promise<string[]> {
+    const { simpleGit } = await loadSimpleGit();
+    const wtGit = simpleGit(worktreePath, {
+      errors: carryApplyErrorDetection,
+    }).env(gitEnv());
+    let carryError: WorktreeDirtyCarryConflictError | null = null;
+    if (dirtyState.stashCommit) {
+      let applyError: unknown;
+      try {
+        await wtGit.raw(['stash', 'apply', dirtyState.stashCommit]);
+      } catch (error) {
+        applyError = error;
+      }
+      // A conflicting 3-way apply writes conflict markers and unmerged
+      // index entries — simple-git's raw mode may RESOLVE even on the
+      // non-zero exit, so detect by the index state, not the throw. ANY
+      // failure (conflict or environment, e.g. an unwritable path that
+      // leaves a partially applied overlay) must restore committed state:
+      // a fail-open caller baselines whatever is on disk, so a half-applied
+      // tracked overlay must never survive into the baseline.
+      const unmerged = (
+        await wtGit.raw(['ls-files', '-u']).catch(() => '')
+      ).trim();
+      if (unmerged.length > 0 || applyError) {
+        // Do not swallow the restore's own failure: if reset/clean cannot
+        // run (locked index, read-only git dir) the worktree keeps a
+        // half-applied overlay, and the error must not claim it was restored
+        // to committed state — a fail-open caller would baseline that tree.
+        let restoreError: unknown;
+        try {
+          await wtGit.raw(['reset', '--hard', 'HEAD']);
+          await wtGit.raw(['clean', '-fd']);
+        } catch (error) {
+          restoreError = error;
+        }
+        const restoreNote =
+          restoreError !== undefined
+            ? ` (restore to committed state also failed: ${
+                restoreError instanceof Error
+                  ? restoreError.message
+                  : String(restoreError)
+              })`
+            : '';
+        carryError = new WorktreeDirtyCarryConflictError(
+          (unmerged.length > 0
+            ? `Dirty carry conflicted with the worktree base: ${
+                applyError instanceof Error
+                  ? applyError.message
+                  : 'merge conflict'
+              }`
+            : `Dirty carry failed to apply: ${
+                applyError instanceof Error
+                  ? applyError.message
+                  : String(applyError)
+              }`) + restoreNote,
+          {
+            conflict: unmerged.length > 0,
+            restoreFailed: restoreError !== undefined,
+          },
+        );
+      }
+    }
+    // The untracked half runs even when the tracked apply failed: the
+    // reset/clean above restored tracked state, and the carried untracked
+    // work is copied on top of it for fail-open callers. Containment and the
+    // pre-existing-destination skip apply per file. Only paths actually
+    // CREATED are returned, so the caller's carried-overlay record (and its
+    // rollback exemption) never names a skipped entry.
+    const realTargetTop = await fs
+      .realpath(worktreePath)
+      .catch(() => worktreePath);
+    // A tracked file the source deleted into a directory cannot ride the
+    // stash; remove the target's file so the untracked copy below can mkdir
+    // the directory at the same path. Only on a clean tracked apply: a
+    // conflict restored committed state, and a fail-open caller baselines
+    // that committed state (the deletion is part of the conflicted overlay).
+    const removed: string[] = [];
+    if (!carryError) {
+      for (const relPath of dirtyState.removedPaths) {
+        try {
+          const dst = path.join(worktreePath, relPath);
+          const st = await fs.lstat(dst).catch(() => null);
+          if (!st || !st.isFile()) continue;
+          const parent = path.dirname(dst);
+          if (
+            !isWithinRoot(
+              await fs.realpath(parent).catch(() => parent),
+              realTargetTop,
+            )
+          ) {
+            continue;
+          }
+          await fs.rm(dst);
+          removed.push(relPath);
+        } catch {
+          // Fail-open: a removal that cannot land leaves the file, and the
+          // untracked copy skips the entry as it would without the removal.
+        }
+      }
+    }
+    const createdUntracked: string[] = [];
+    for (const relPath of dirtyState.untrackedFiles) {
+      try {
+        if (
+          await this.copyOverlayEntryContained(
+            dirtyState.repoTop,
+            worktreePath,
+            realTargetTop,
+            relPath,
+          )
+        ) {
+          createdUntracked.push(relPath);
+        }
+      } catch {
+        // Non-fatal: skip files that can't be copied.
+      }
+    }
+    if (carryError) throw carryError;
+    return [...removed, ...createdUntracked];
+  }
+
+  /**
    * Sets up all worktrees for a session.
    * This is the main entry point for worktree creation.
    */
@@ -1447,30 +1952,10 @@ export class GitWorktreeService {
     };
     await fs.writeFile(configPath, JSON.stringify(configFile, null, 2));
 
-    // Capture the current dirty state (tracked: staged + unstaged changes)
-    // without modifying the source working tree or index.
-    // NOTE: `git stash create` does NOT support --include-untracked;
-    // untracked files are handled separately below via file copy.
-    let dirtyStateSnapshot = '';
-    try {
-      dirtyStateSnapshot = (
-        await (await this.getGit()).stash(['create'])
-      ).trim();
-    } catch {
-      // Ignore — proceed without dirty state if stash create fails
-    }
-
-    // Discover untracked files so they can be copied into each worktree.
-    // `git ls-files --others --exclude-standard` is read-only and safe.
-    let untrackedFiles: string[] = [];
-    try {
-      const raw = await (
-        await this.getGit()
-      ).raw(['ls-files', '--others', '--exclude-standard']);
-      untrackedFiles = raw.trim().split('\n').filter(Boolean);
-    } catch {
-      // Non-fatal: proceed without untracked files
-    }
+    // Capture the current dirty state (tracked: staged + unstaged changes,
+    // plus untracked files) once, without modifying the source working tree
+    // or index, then overlay it onto each worktree below.
+    const dirtyState = await this.captureDirtyState();
 
     // Create worktrees for each entry
     for (const name of config.worktreeNames) {
@@ -1512,33 +1997,28 @@ export class GitWorktreeService {
     // see the same files the user currently has on disk.
     if (result.success) {
       for (const worktree of result.worktrees) {
-        const { simpleGit } = await loadSimpleGit();
-        const wtGit = simpleGit(worktree.path);
-
-        // 1. Apply tracked dirty changes (staged + unstaged)
-        if (dirtyStateSnapshot) {
-          try {
-            await wtGit.raw(['stash', 'apply', dirtyStateSnapshot]);
-          } catch {
-            // Non-fatal: worktree still usable with committed state only
-          }
+        // 1. Apply tracked dirty changes and copy untracked files. A
+        // conflicting carry restores committed state and throws; the
+        // worktree stays usable at committed state, and the baseline
+        // commit below must never stage conflict markers. If the restore
+        // itself failed the tree may hold a half-applied overlay — refuse
+        // to baseline it as pre-existing user state rather than commit it.
+        try {
+          await this.applyDirtyState(worktree.path, dirtyState);
+        } catch (error) {
+          if (!(error instanceof WorktreeDirtyCarryConflictError)) throw error;
+          if (error.restoreFailed) throw error;
+          debugLogger.warn(
+            `setupWorktrees: dirty carry conflicted for ${worktree.name}; ` +
+              'using committed state',
+          );
         }
 
-        // 2. Copy untracked files into the worktree
-        for (const relPath of untrackedFiles) {
-          try {
-            const src = path.join(this.sourceRepoPath, relPath);
-            const dst = path.join(worktree.path, relPath);
-            await fs.mkdir(path.dirname(dst), { recursive: true });
-            await fs.copyFile(src, dst);
-          } catch {
-            // Non-fatal: skip files that can't be copied
-          }
-        }
-
-        // 3. Create a baseline commit capturing the full starting state
+        // 2. Create a baseline commit capturing the full starting state
         //    (committed + dirty + untracked). This allows us to later diff
         //    only the agent's changes, excluding the pre-existing dirty state.
+        const { simpleGit } = await loadSimpleGit();
+        const wtGit = simpleGit(worktree.path).env(gitEnv());
         try {
           await wtGit.add(['--all']);
           await wtGit.commit(BASELINE_COMMIT_MESSAGE, {
@@ -2031,11 +2511,13 @@ export class GitWorktreeService {
    *
    * Implementation — a single `git rev-parse` returning four lines:
    * 1. `HEAD` → the worktree's HEAD commit SHA (must come BEFORE
-   *    `--abbrev-ref` since the flag sticks for all subsequent refs).
-   * 2. `--abbrev-ref HEAD` → the branch name. A detached HEAD produces
-   *    `HEAD` here, which we treat as "no real branch" and return null
-   *    — the caller's re-attach gate will then refuse, since the
-   *    slug-derived branch couldn't possibly be `HEAD`.
+   *    `--symbolic-full-name` since the flag sticks for subsequent refs).
+   * 2. `--symbolic-full-name HEAD` → the full branch ref
+   *    (`refs/heads/<name>`), normalized to the bare name. The full ref is
+   *    used instead of `--abbrev-ref` because a same-named tag makes the
+   *    short name ambiguous (`heads/<name>`), which would never match the
+   *    sidecar's bare record. A detached HEAD produces `HEAD` here, reported
+   *    with the empty-string branch convention so callers can re-attach.
    * 3. `--git-common-dir` → the common `.git` directory. For a real
    *    linked worktree of this repo that's `<sourceRepoPath>/.git`;
    *    for a sibling `git init` it resolves to `<worktreePath>/.git`.
@@ -2082,7 +2564,7 @@ export class GitWorktreeService {
         probeGit.raw([
           'rev-parse',
           'HEAD',
-          '--abbrev-ref',
+          '--symbolic-full-name',
           'HEAD',
           '--git-common-dir',
           '--show-toplevel',
@@ -2120,8 +2602,14 @@ export class GitWorktreeService {
       );
       return null;
     }
-    if (!branch || branch === 'HEAD') return null;
-    return { branch, headCommit };
+    if (!branch) return null;
+    // A detached worktree is registered but has no branch ref; report it
+    // with the empty-string branch convention so callers can re-attach.
+    if (branch === 'HEAD') return { branch: '', headCommit };
+    // The probe reports the full ref (`refs/heads/<name>`); drop the fixed
+    // namespace so the bare name matches the sidecar record even when a
+    // same-named tag would make `--abbrev-ref` qualify it as `heads/<name>`.
+    return { branch: bareBranchName(branch), headCommit };
   }
 
   /**
@@ -2453,6 +2941,38 @@ export class GitWorktreeService {
       symlinkDirectories?: readonly string[];
       /** The caller owns the pr-<N> shape (PR-backed startup). */
       prBacked?: boolean;
+      /**
+       * Apply the source checkout's uncommitted changes (tracked staged +
+       * unstaged, and untracked files) to the new worktree, so a session
+       * starts from the same files the user has on disk. Fail-open per
+       * step; no baseline commit is created.
+       */
+      carryDirtyState?: boolean;
+      /**
+       * Checkout to capture the dirty state from when it differs from
+       * this service's root: the worktree is placed under the service
+       * root's managed directory, but the session may live in another
+       * checkout of the same repository whose HEAD differs from the
+       * main checkout's. Defaults to the service root.
+       */
+      dirtyStateSource?: string;
+      /**
+       * Upper bound on the serialized carried-path list, for callers that
+       * persist it in a size-capped record (the branch-preparation
+       * journal). Above the bound the carry is skipped (fail-open to
+       * committed state) so the record stays readable. Callers that write
+       * no journal (handoff, POST /session) leave this unset and carry
+       * any size — silently dropping a large overlay there would move the
+       * session without the user's work.
+       */
+      maxCarriedPathsBytes?: number;
+      /**
+       * Create the worktree in detached HEAD instead of on a named
+       * `worktree-<slug>` branch (Codex-style managed worktrees: several
+       * sessions without polluting the branch list). The returned
+       * `WorktreeInfo.branch` is `''` while detached.
+       */
+      detached?: boolean;
     },
   ): Promise<CreateWorktreeResult> {
     const validationError = GitWorktreeService.validateUserWorktreeSlug(
@@ -2484,25 +3004,32 @@ export class GitWorktreeService {
       await this.ensureWorktreesGitignored();
 
       const base = baseBranch || (await this.getCurrentBranch());
-      const branchName = worktreeBranchForSlug(slug);
+      const detached = options?.detached === true;
+      const branchName = detached ? '' : worktreeBranchForSlug(slug);
 
-      // Refuse to clobber a pre-existing branch with the same name. Use
-      // `git show-ref --verify --quiet refs/heads/<branch>` (exit 0 →
-      // branch exists). The previous `-B` form would have force-reset
-      // such a branch and silently dropped unmerged commits.
-      const branchExists = await this.localBranchExists(branchName);
-      if (branchExists) {
-        const error =
-          `Cannot create worktree "${slug}": branch ${branchName} already exists. ` +
-          `Choose a different name, or delete the branch first ` +
-          `(e.g. \`git branch -d ${branchName}\`).`;
-        debugLogger.warn(`createUserWorktree: ${error}`);
-        return { success: false, error };
+      if (!detached) {
+        // Refuse to clobber a pre-existing branch with the same name. Use
+        // `git show-ref --verify --quiet refs/heads/<branch>` (exit 0 →
+        // branch exists). The previous `-B` form would have force-reset
+        // such a branch and silently dropped unmerged commits.
+        const branchExists = await this.localBranchExists(branchName);
+        if (branchExists) {
+          const error =
+            `Cannot create worktree "${slug}": branch ${branchName} already exists. ` +
+            `Choose a different name, or delete the branch first ` +
+            `(e.g. \`git branch -d ${branchName}\`).`;
+          debugLogger.warn(`createUserWorktree: ${error}`);
+          return { success: false, error };
+        }
       }
 
       await (
         await this.getGit()
-      ).raw(['worktree', 'add', '-b', branchName, worktreePath, base]);
+      ).raw(
+        detached
+          ? ['worktree', 'add', '--detach', worktreePath, base]
+          : ['worktree', 'add', '-b', branchName, worktreePath, base],
+      );
 
       // Configure core.hooksPath so commits inside the worktree run the
       // main repo's hooks (the new worktree's .git directory has no hooks
@@ -2531,6 +3058,72 @@ export class GitWorktreeService {
         });
       }
 
+      let carriedPaths: string[] | undefined;
+      if (options?.carryDirtyState === true) {
+        const captureService =
+          options.dirtyStateSource !== undefined &&
+          options.dirtyStateSource !== this.sourceRepoPath
+            ? new GitWorktreeService(options.dirtyStateSource)
+            : this;
+        const dirtyState = await captureService.captureDirtyState();
+        if (dirtyState.captureError !== null) {
+          // Capturing the tracked overlay failed (held index.lock, read-only
+          // git dir). An empty carry here is NOT a clean source: refuse and
+          // remove the worktree rather than relocate the session without the
+          // user's tracked edits. Scoped to carry-requesting callers —
+          // setupWorktrees ignores captureError and keeps its fail-open degrade.
+          await this.removeWorktree(worktreePath).catch(() => undefined);
+          return {
+            success: false,
+            error: `Failed to capture the source checkout's dirty state: ${dirtyState.captureError}`,
+          };
+        }
+        const overlay = [
+          ...dirtyState.trackedFiles,
+          ...dirtyState.removedPaths,
+          ...dirtyState.untrackedFiles,
+        ];
+        // Byte length, not character count: the journal is written as
+        // UTF-8 and its cap is in bytes, so non-ASCII paths must be
+        // measured the way the reader will refuse them. Only journal-backed
+        // callers set a bound; the handoff and POST /session carry any size.
+        const bound = options.maxCarriedPathsBytes;
+        if (
+          bound !== undefined &&
+          Buffer.byteLength(JSON.stringify(overlay), 'utf8') > bound
+        ) {
+          // Too large to persist in the preparation journal: skip the
+          // carry rather than create a worktree no rollback can reap.
+          debugLogger.warn(
+            `createUserWorktree: dirty overlay too large to record for ${slug} ` +
+              `(${overlay.length} paths); starting from committed state`,
+          );
+        } else {
+          let createdUntracked: string[];
+          try {
+            createdUntracked = await this.applyDirtyState(
+              worktreePath,
+              dirtyState,
+            );
+          } catch (error) {
+            if (error instanceof WorktreeDirtyCarryConflictError) {
+              // The worktree was restored to committed state; remove it so
+              // a failed carry leaves no checkout behind, and fail closed
+              // rather than relocate the session without the user's work.
+              await this.removeWorktree(worktreePath).catch(() => undefined);
+              return { success: false, error: error.message };
+            }
+            throw error;
+          }
+          // Record only what the carry actually applied: every tracked path
+          // (the apply succeeded) plus the paths applyDirtyState created or
+          // explicitly removed (untracked copies and file→directory deletions).
+          // A skipped untracked entry (pre-existing destination or escaping
+          // ancestor symlink) is not part of the overlay the rollback exempts.
+          carriedPaths = [...dirtyState.trackedFiles, ...createdUntracked];
+        }
+      }
+
       const worktree: WorktreeInfo = {
         id: slug,
         name: slug,
@@ -2539,11 +3132,189 @@ export class GitWorktreeService {
         isActive: true,
         createdAt: Date.now(),
       };
-      return { success: true, worktree };
+      return { success: true, worktree, carriedPaths };
     } catch (error) {
       const message = `Failed to create worktree "${slug}": ${error instanceof Error ? error.message : 'Unknown error'}`;
       debugLogger.warn(`createUserWorktree: ${message}`);
       return { success: false, error: message };
+    }
+  }
+
+  /**
+   * Detaches a checkout at its current HEAD, releasing any branch it holds
+   * so another checkout can check that branch out (git forbids the same
+   * branch in two worktrees). Uncommitted changes survive the detach.
+   */
+  async detachCheckout(checkoutPath: string): Promise<void> {
+    const { simpleGit } = await loadSimpleGit();
+    await simpleGit(checkoutPath).env(gitEnv()).raw(['checkout', '--detach']);
+  }
+
+  /**
+   * Checks out an existing branch in a checkout (handoff carry). Throws on
+   * git's own refusals (dirty tree, branch checked out elsewhere) so the
+   * caller can map them to a typed refusal.
+   */
+  async checkoutBranchInCheckout(
+    checkoutPath: string,
+    branchName: string,
+  ): Promise<void> {
+    const { simpleGit } = await loadSimpleGit();
+    await simpleGit(checkoutPath).env(gitEnv()).raw(['checkout', branchName]);
+  }
+
+  /**
+   * Force-checkout a branch, discarding tracked working-tree changes.
+   * Rollback-only: the caller must know the checkout's prior state was
+   * clean (or a copy it can afford to lose).
+   */
+  async forceCheckoutBranch(
+    checkoutPath: string,
+    branchName: string,
+  ): Promise<void> {
+    const { simpleGit } = await loadSimpleGit();
+    await simpleGit(checkoutPath)
+      .env(gitEnv())
+      .raw(['checkout', '-f', branchName]);
+  }
+
+  /**
+   * Delete a local branch even when it carries unmerged commits.
+   * Rollback-only: used to drop a branch this process just created.
+   */
+  async deleteLocalBranch(branchName: string): Promise<void> {
+    await (await this.getGit()).branch(['-D', branchName]);
+  }
+
+  /**
+   * Captures a checkout's uncommitted tracked changes as a stash commit
+   * without touching its working tree or index (`git stash create`).
+   * Returns '' when there is nothing to capture. Untracked files are not
+   * included — callers copy them separately when needed.
+   */
+  async createStashSnapshot(checkoutPath: string): Promise<string> {
+    const { simpleGit } = await loadSimpleGit();
+    return (
+      await simpleGit(checkoutPath).env(gitEnv()).stash(['create'])
+    ).trim();
+  }
+
+  /**
+   * Applies a stash commit snapshot in a checkout (`git stash apply`).
+   * Throws WorktreeDirtyCarryConflictError when the 3-way apply conflicts
+   * (detected by unmerged index entries — simple-git's raw mode may resolve
+   * even on the non-zero exit), restoring the checkout to committed state
+   * first so no conflict markers survive; when that restore itself fails
+   * the error carries `restoreFailed` and the checkout may still hold the
+   * markers, so the caller's rollback must not assume a clean checkout.
+   * Any other apply failure (e.g. an unwritable index) also throws: the
+   * handoff must never move the session without the user's work, so there
+   * is no fail-open here.
+   */
+  async applyStashSnapshot(
+    checkoutPath: string,
+    snapshot: string,
+  ): Promise<void> {
+    const { simpleGit } = await loadSimpleGit();
+    const git = simpleGit(checkoutPath, {
+      errors: carryApplyErrorDetection,
+    }).env(gitEnv());
+    let applyError: unknown;
+    try {
+      await git.raw(['stash', 'apply', snapshot]);
+    } catch (error) {
+      applyError = error;
+    }
+    let unmergedRaw: string | null = null;
+    try {
+      unmergedRaw = await git.raw(['ls-files', '-u']);
+    } catch {
+      unmergedRaw = null;
+    }
+    const unmerged = (unmergedRaw ?? '').trim();
+    if (unmerged.length > 0) {
+      // Do not swallow the restore's own failure: if reset cannot run
+      // (locked index, read-only git dir) the checkout keeps the conflict
+      // markers, and the error must not claim it was restored — the
+      // caller's rollback needs to know the checkout may still be dirty.
+      let restoreError: unknown;
+      try {
+        await git.raw(['reset', '--hard', 'HEAD']);
+      } catch (error) {
+        restoreError = error;
+      }
+      const restoreNote =
+        restoreError !== undefined
+          ? ` (restore to committed state also failed: ${
+              restoreError instanceof Error
+                ? restoreError.message
+                : String(restoreError)
+            })`
+          : '';
+      throw new WorktreeDirtyCarryConflictError(
+        `Stash snapshot conflicted with the checkout: ${
+          applyError instanceof Error ? applyError.message : 'merge conflict'
+        }` + restoreNote,
+        { restoreFailed: restoreError !== undefined },
+      );
+    }
+    if (applyError || unmergedRaw === null) {
+      // A non-conflict apply failure (e.g. an unwritable index), or an index
+      // state that could not be read to confirm a clean apply: the handoff
+      // must not move the session without the user's work. Fail closed —
+      // unlike the worktree-creation path, there is no fail-open here.
+      throw new WorktreeDirtyCarryConflictError(
+        applyError
+          ? `Stash snapshot failed to apply: ${
+              applyError instanceof Error
+                ? applyError.message
+                : String(applyError)
+            }`
+          : 'Stash snapshot applied but the index state could not be read to confirm a clean apply',
+        { conflict: false },
+      );
+    }
+  }
+
+  /**
+   * Turns a detached worktree into a named branch at its current HEAD
+   * ("Create branch here", Codex parity). Throws when the checkout is not
+   * detached or the branch name is already taken — callers validate first
+   * and map the failure to a typed refusal. A post-checkout hook failure
+   * after the switch succeeded is NOT a failure: the branch exists and
+   * the checkout sits on it, so callers must record it (treating it as
+   * "no branch" would leave the sidecar naming a state that no longer
+   * exists and wedge every later handoff in worktree_branch_mismatch).
+   */
+  async createWorktreeBranch(
+    worktreePath: string,
+    branchName: string,
+  ): Promise<void> {
+    const { simpleGit } = await loadSimpleGit();
+    const wtGit = simpleGit(worktreePath).env(gitEnv());
+    const symbolic = (
+      await wtGit.revparse(['--symbolic-full-name', 'HEAD'])
+    ).trim();
+    if (symbolic !== 'HEAD') {
+      throw new Error(`Worktree at ${worktreePath} is not detached`);
+    }
+    if (await this.localBranchExists(branchName)) {
+      throw new Error(`Branch ${branchName} already exists`);
+    }
+    try {
+      await wtGit.raw(['switch', '-c', branchName]);
+    } catch (error) {
+      // `switch -c` moves the checkout BEFORE the post-checkout hook runs.
+      // If the checkout now sits on the new branch, the operation's goal
+      // is achieved even though the hook threw. Compare on the bare name:
+      // a same-named tag would make `--abbrev-ref` report `heads/<name>`,
+      // rethrowing after a switch that actually landed.
+      const now = bareBranchName(
+        (
+          await wtGit.revparse(['--symbolic-full-name', 'HEAD']).catch(() => '')
+        ).trim(),
+      );
+      if (now !== branchName) throw error;
     }
   }
 
@@ -2919,7 +3690,7 @@ export class GitWorktreeService {
    * fast path attempts the create (which itself will fail loudly if the
    * branch exists for some reason this check missed).
    */
-  private async localBranchExists(branchName: string): Promise<boolean> {
+  async localBranchExists(branchName: string): Promise<boolean> {
     try {
       const out = await (
         await this.getGit()
@@ -2942,38 +3713,215 @@ export class GitWorktreeService {
   }
 
   /**
-   * Ensures `<projectRoot>/.qwen/.gitignore` ignores the worktrees
-   * directory. Idempotent: writes only when the file is missing. If the
-   * file exists (user may have curated it), this method is a no-op so
-   * we never disturb intentional configuration.
+   * Ignores the managed worktrees directory through the repository's
+   * `info/exclude`, idempotently. The rule must not live in a checkout
+   * file: a daemon-written `.qwen/.gitignore` is itself untracked work,
+   * which made the handoff's local-clean gate refuse every pristine
+   * checkout and the cleanup's has-work gate preserve every clean
+   * worktree. `info/exclude` keeps `git status` clean without adding an
+   * entry of its own. A pattern containing a slash anchors at the repo
+   * root, so the rule is computed relative to the repository top — a
+   * service rooted at a subdirectory ignores its own `.qwen/worktrees`.
    */
   private async ensureWorktreesGitignored(): Promise<void> {
     try {
-      const qwenDir = path.join(this.sourceRepoPath, '.qwen');
-      await fs.mkdir(qwenDir, { recursive: true });
-      const gitignorePath = path.join(qwenDir, '.gitignore');
-      // `flag: 'wx'` is "open for write, fail if exists" — one atomic
-      // syscall that handles the "preserve user-curated file" case
-      // without the `fs.access` + `fs.writeFile` TOCTOU race two
-      // concurrent agent invocations would otherwise hit.
-      try {
-        await fs.writeFile(
-          gitignorePath,
-          `# Auto-generated by qwen-code.\n${WORKTREES_DIR}/\n`,
-          { encoding: 'utf8', flag: 'wx' },
-        );
-      } catch (error) {
-        if (isNodeError(error) && error.code === 'EEXIST') {
-          return; // User-curated file already in place.
-        }
-        throw error;
-      }
+      await this.ensureWorktreesExcludeRule();
+      await this.migrateLegacyWorktreeGitignore();
     } catch (error) {
-      // Best-effort: if writing the gitignore fails (read-only fs, etc.)
+      // Best-effort: if writing the exclude fails (read-only fs, etc.)
       // it is not worth aborting the worktree creation.
       debugLogger.warn(
         `ensureWorktreesGitignored failed (non-fatal): ${error}`,
       );
+    }
+  }
+
+  /**
+   * Writes and verifies the `info/exclude` rule only — no legacy
+   * migration. The migration calls this before unlinking the old file so
+   * the replacement exists before the old mechanism is removed. Returns
+   * true only when the rule is in force; the migration must keep the
+   * legacy file when this returns false (unrepresentable path or a rule
+   * git does not honor), or the checkout loses its only hiding mechanism.
+   */
+  private async ensureWorktreesExcludeRule(): Promise<boolean> {
+    const git = await this.getGit();
+    const excludeRel = (
+      await git.raw(['rev-parse', '--git-path', 'info/exclude'])
+    ).trim();
+    const excludePath = path.resolve(this.sourceRepoPath, excludeRel);
+    // Canonicalize both sides: git reports a physical toplevel, and a
+    // symlinked service root would otherwise produce a ../-prefixed
+    // (malformed) relative rule.
+    const realRoot = await fs
+      .realpath(this.sourceRepoPath)
+      .catch(() => this.sourceRepoPath);
+    const repoTop =
+      (await this.getRepoTopLevel().catch(() => null)) ?? realRoot;
+    const rel = path.relative(
+      repoTop,
+      path.join(realRoot, '.qwen', WORKTREES_DIR),
+    );
+    // The rule is a gitignore pattern, not a path: escape the pattern
+    // metacharacters per segment (a route directory like app/[id]
+    // would otherwise become a character class matching nothing).
+    // A line-based pattern cannot represent newline-bearing components
+    // or an out-of-root target; skip and log instead of writing garbage.
+    // Test for an actual parent segment, not a '..' prefix: an in-root
+    // directory named '..cache' is legal and must still get a rule.
+    const segments = rel.split(path.sep);
+    if (
+      rel === '..' ||
+      rel.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(rel) ||
+      segments.some((s) => /[\n\r]/.test(s))
+    ) {
+      debugLogger.warn(
+        `ensureWorktreesGitignored: cannot represent ${rel} as an exclude rule; skipping`,
+      );
+      return false;
+    }
+    const escaped = segments
+      .map((s) =>
+        s
+          .replace(/[\\*?[\]#!]/g, '\\$&')
+          .replace(/ +$/, (m) => m.replace(/ /g, '\\ ')),
+      )
+      .join('/');
+    const rule = `/${escaped}/`;
+    let existing = '';
+    try {
+      existing = await fs.readFile(excludePath, 'utf8');
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
+    }
+    if (!existing.split('\n').some((line) => line.trim() === rule)) {
+      await fs.mkdir(path.dirname(excludePath), { recursive: true });
+      const prefix =
+        existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
+      await fs.appendFile(excludePath, `${prefix}${rule}\n`, 'utf8');
+    }
+    // Verify against git itself that the rule JUST WRITTEN is the one in
+    // force. A bare `check-ignore -q` is vacuous twice over: it exits 1
+    // with no output when the path is not ignored (simple-git's default
+    // detector resolves that, so a `.then(() => true)` always wins), and it
+    // answers whether ANY source ignores the path — a higher-priority
+    // per-directory `.gitignore` (e.g. `.qwen/*` + `!.qwen/worktrees/`)
+    // would answer for the info/exclude rule and let the migration unlink
+    // the only effective hiding mechanism. Use `-v` and accept only a
+    // verdict whose source is this exclude file and whose pattern is the
+    // rule. Forward slashes: a win32 native path would read as an escaped
+    // pathspec. Probe a FILE path, not the directory: a directory-form
+    // re-include negation only applies to paths git knows are directories.
+    const probe = path
+      .join(realRoot, '.qwen', WORKTREES_DIR, 'probe')
+      .split(path.sep)
+      .join('/');
+    // The legacy daemon .qwen/.gitignore outranks info/exclude and is the
+    // very file the migration removes, so verify with it temporarily moved
+    // aside — otherwise it answers for the rule just written and the probe
+    // can never attribute the match to info/exclude. A user-curated
+    // .gitignore (any other content) is left in place: if it outranks the
+    // rule (e.g. re-includes the worktrees path), the rule is powerless and
+    // the migration must keep the legacy file.
+    const legacyGitignore = path.join(
+      this.sourceRepoPath,
+      '.qwen',
+      '.gitignore',
+    );
+    let legacyMoved: string | null = null;
+    const legacyContent = await fs
+      .readFile(legacyGitignore, 'utf8')
+      .catch(() => null);
+    if (
+      legacyContent === `# Auto-generated by qwen-code.\n${WORKTREES_DIR}/\n`
+    ) {
+      const moved = `${legacyGitignore}.probe-tmp`;
+      try {
+        await fs.rename(legacyGitignore, moved);
+        legacyMoved = moved;
+      } catch {
+        // Leave it in place; the probe below will attribute conservatively.
+      }
+    }
+    let verdict = '';
+    try {
+      verdict = (
+        await git.raw(['check-ignore', '-v', '--', probe]).catch(() => '')
+      ).trim();
+    } finally {
+      if (legacyMoved !== null) {
+        await fs.rename(legacyMoved, legacyGitignore).catch(() => undefined);
+      }
+    }
+    // Format: "<source>:<linenum>:<pattern>\t<path>". Parse from the right
+    // (a win32 drive letter and the pattern itself can contain ':'); the
+    // line number is the numeric anchor.
+    const match = /^(.*):(\d+):(.*)$/.exec(verdict.split('\t')[0]);
+    const realExclude = await fs.realpath(excludePath).catch(() => excludePath);
+    // git reports the source relative to its cwd (the repo top), e.g.
+    // ".git/info/exclude"; resolve it there before comparing realpaths.
+    const reportedSource = match
+      ? await fs
+          .realpath(path.resolve(repoTop, match[1]))
+          .catch(() => path.resolve(repoTop, match[1]))
+      : null;
+    // Attribute by SOURCE, not by exact pattern: git reports only the first
+    // matching pattern, so a broader rule already in this exclude file
+    // (e.g. an older `.qwen/`) answers for the probe even though the rule
+    // just written also matches. The path is ignored by this file either
+    // way, so the migration may complete; requiring pattern equality would
+    // strand the legacy file in that shape. A verdict sourced from any
+    // OTHER file (a user .gitignore re-include) still fails.
+    if (!match || reportedSource !== realExclude) {
+      debugLogger.warn(
+        `ensureWorktreesGitignored: rule ${rule} does not ignore the worktrees directory`,
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Drop the daemon-generated `.qwen/.gitignore` when it is byte-exactly
+   * ours and UNTRACKED, so checkouts provisioned by an earlier build stop
+   * reading as dirty. A tracked file (the user committed it) or any other
+   * content is the user's and stays. Called at provisioning and on the
+   * handoff paths, which an upgraded checkout may reach without creating
+   * a new worktree first.
+   */
+  async migrateLegacyWorktreeGitignore(): Promise<void> {
+    try {
+      const legacyGitignore = path.join(
+        this.sourceRepoPath,
+        '.qwen',
+        '.gitignore',
+      );
+      const content = await fs.readFile(legacyGitignore, 'utf8');
+      if (content !== `# Auto-generated by qwen-code.\n${WORKTREES_DIR}/\n`) {
+        return;
+      }
+      const git = await this.getGit();
+      // A git pathspec, not a filesystem path: path.join would produce
+      // backslashes on win32, which git parses as escapes, matching
+      // nothing and unlinking a file the user committed.
+      const tracked = await git.raw(['ls-files', '--', '.qwen/.gitignore']);
+      if (tracked.trim().length === 0) {
+        // Establish the info/exclude replacement BEFORE removing the old
+        // mechanism: an upgraded checkout whose worktree predates the
+        // exclude rule would otherwise read as dirty the moment the
+        // legacy file is gone, and the handoff's clean gate would refuse
+        // every handoff with local_checkout_dirty. When the rule cannot
+        // be established (unrepresentable path, or git does not honor
+        // it), keep the legacy file — it is still the only mechanism
+        // hiding the managed directory.
+        const established = await this.ensureWorktreesExcludeRule();
+        if (established) {
+          await fs.unlink(legacyGitignore);
+        }
+      }
+    } catch {
+      // Absent or unreadable: nothing to migrate.
     }
   }
 
@@ -2989,14 +3937,66 @@ export class GitWorktreeService {
    */
   async removeUserWorktree(
     slug: string,
-    options: { deleteBranch?: boolean; forceDeleteBranch?: boolean } = {},
+    options: {
+      deleteBranch?: boolean;
+      forceDeleteBranch?: boolean;
+      /** The slug-derived branch was created by this worktree's named
+       * creation (which refuses a pre-existing ref), so it is owned even
+       * if the checkout later moved to another branch. Without this,
+       * ownership is inferred from the checkout's current branch — safe
+       * for detached and in-place-branched session worktrees, which never
+       * created the slug ref. */
+      branchOwned?: boolean;
+      /** The commit the worktree was created at. Lets the detached guard
+       * tell "the agent committed here" from "the base itself is
+       * unreachable" (a tag checkout, or a branch since moved/deleted). */
+      baseCommit?: string;
+    } = {},
   ): Promise<{
     success: boolean;
     error?: string;
     branchPreserved?: boolean;
+    /** The slug branch was not deleted (the checkout never owned it, or
+     * the delete was refused). Distinct from branchPreserved, which means
+     * the checkout itself survived. */
+    branchSkipped?: boolean;
+    /** The branch this call actually deleted, if any. Callers report from
+     * this, not from the slug name. */
+    deletedBranch?: string;
+    /** A branch that survives this call and holds the work (the checkout's
+     * own branch, or the slug ref when kept), if any. */
+    keptBranch?: string;
   }> {
     const worktreePath = this.getUserWorktreePath(slug);
     const branchName = worktreeBranchForSlug(slug);
+    const detached = await this.isDetachedWorktree(worktreePath);
+    // Capture the branch the checkout actually sits on BEFORE removal.
+    // A session worktree branched in place ("Create branch here") is no
+    // longer detached, but it never owned the slug-derived name either —
+    // keying the delete off the current detached state alone would let a
+    // pre-existing user `worktree-<slug>` be deleted once it merges.
+    const actualBranch = detached
+      ? ''
+      : await this.getWorktreeBranchName(worktreePath);
+
+    // A detached worktree has no branch whose safe-delete refusal would
+    // protect committed work: the `git branch -d` below can never fire for
+    // it, and removing the checkout would leave the agent's commits
+    // unreachable. Refuse the removal itself when HEAD carries commits of
+    // its own that no other ref reaches — the detached counterpart of the
+    // named-branch protection. An explicit force delete opts out.
+    if (
+      options.deleteBranch &&
+      !options.forceDeleteBranch &&
+      detached &&
+      (await this.hasUnmergedWorktreeCommits(slug, options.baseCommit))
+    ) {
+      return {
+        success: false,
+        error: 'Worktree has unmerged commits',
+        branchPreserved: true,
+      };
+    }
 
     const removed = await this.removeWorktree(worktreePath);
     if (!removed.success) {
@@ -3007,6 +4007,36 @@ export class GitWorktreeService {
       return { success: true };
     }
 
+    // A named creation provably owns its slug ref (creation refuses a
+    // pre-existing branch), even when the checkout later moved away.
+    // Otherwise only a checkout sitting on the slug branch owns it:
+    // detached and in-place-branched session worktrees never created that
+    // ref, and an existing one belongs to someone else who must keep it.
+    const ownsSlugBranch =
+      options.branchOwned === true || actualBranch === branchName;
+    const keptOther =
+      actualBranch !== '' && actualBranch !== branchName
+        ? actualBranch
+        : undefined;
+    if (!ownsSlugBranch) {
+      const slugRefExists = await this.localBranchExists(branchName);
+      const kept = keptOther ?? (slugRefExists ? branchName : undefined);
+      return {
+        success: true,
+        branchSkipped: slugRefExists || keptOther !== undefined,
+        ...(kept !== undefined ? { keptBranch: kept } : {}),
+      };
+    }
+
+    // A detached worktree (Codex-style managed session) has no branch to
+    // delete; neither does a named worktree whose branch is already gone.
+    if (!(await this.localBranchExists(branchName))) {
+      return {
+        success: true,
+        ...(keptOther !== undefined ? { keptBranch: keptOther } : {}),
+      };
+    }
+
     // Try a safe (non-force) delete first. `git branch -d` refuses to
     // remove branches whose tip is not reachable from HEAD or any
     // upstream — preserving any commits the subagent made before
@@ -3014,7 +4044,11 @@ export class GitWorktreeService {
     const git = await this.getGit();
     try {
       await git.branch(['-d', branchName]);
-      return { success: true };
+      return {
+        success: true,
+        deletedBranch: branchName,
+        ...(keptOther !== undefined ? { keptBranch: keptOther } : {}),
+      };
     } catch (error) {
       // Refused either because the branch carries unmerged commits
       // (the common case, handled below by surfacing `branchPreserved`)
@@ -3029,7 +4063,11 @@ export class GitWorktreeService {
     if (options.forceDeleteBranch) {
       try {
         await git.branch(['-D', branchName]);
-        return { success: true };
+        return {
+          success: true,
+          deletedBranch: branchName,
+          ...(keptOther !== undefined ? { keptBranch: keptOther } : {}),
+        };
       } catch (error) {
         // Best-effort: branch may have been deleted already, or may not
         // exist (a no-op). Still log because a true filesystem error
@@ -3043,14 +4081,27 @@ export class GitWorktreeService {
     // Reached here when the branch had unmerged commits and the caller
     // did not opt into force-delete. Surface this so callers can leave
     // a note for the user.
-    return { success: true, branchPreserved: true };
+    return { success: true, branchPreserved: true, keptBranch: branchName };
   }
 
+  /**
+   * Remove a prepared (never-attached) worktree. The forced removal is
+   * safe only under the caller guarantees enforced here: the marker names
+   * `expectedOwner` (or is absent for a null owner), HEAD never left
+   * `expectedBaseCommit` (no agent commit exists), and the cleanliness
+   * gate exempts ONLY `carriedPaths` — the exact overlay the creation
+   * carried, which the source checkout still holds. Any other file
+   * refuses the removal. Callers: the branch-worktree route cleanup and
+   * the startup journal recovery, both passing the journal's
+   * `carriedPaths` and `worktreeBranch !== ''` ownership.
+   */
   async removePreparedUserWorktree(
     slug: string,
     expectedOwner: string | null,
     expectedBaseCommit: string,
     onWorktreeRemoved?: () => Promise<void>,
+    branchOwned = true,
+    carriedPaths?: readonly string[],
   ): Promise<{
     success: boolean;
     error?: string;
@@ -3123,9 +4174,28 @@ export class GitWorktreeService {
           worktreeGit.revparse(['HEAD']),
           worktreeGit.revparse(['--abbrev-ref', 'HEAD']),
         ]);
+        // A detached managed worktree reports 'HEAD'; a named one must
+        // still sit on its own worktree-<slug> branch.
         return (
           head.trim() === expectedBaseCommit &&
-          branch.trim() === worktreeBranchForSlug(slug)
+          (branch.trim() === 'HEAD' ||
+            branch.trim() === worktreeBranchForSlug(slug))
+        );
+      };
+      // The worktree still sits at the base commit: named worktrees are
+      // pinned by their branch ref, detached ones by HEAD itself.
+      const atBase = async () => {
+        const branch = (
+          await worktreeGit.revparse(['--abbrev-ref', 'HEAD'])
+        ).trim();
+        if (branch === 'HEAD') {
+          return (
+            (await worktreeGit.revparse(['HEAD'])).trim() === expectedBaseCommit
+          );
+        }
+        return (
+          (await this.getPreparedUserWorktreeBranchTip(slug)) ===
+          expectedBaseCommit
         );
       };
       if (!(await checkoutMatches())) {
@@ -3161,8 +4231,34 @@ export class GitWorktreeService {
         }
         return false;
       };
+      // A prepared worktree is created with carryDirtyState and never
+      // attached: its dirty content is the carried overlay, a copy of
+      // state the source checkout still holds, and the atBase /
+      // checkoutMatches gates below prove no commit was added. A plain
+      // cleanliness gate could therefore never pass for a dirty source
+      // and would strand the worktree + journal forever. The overlay is
+      // exempt — but ONLY the exact carried paths: any other file (a
+      // nested marker-like name, a late-arriving ignored file) still
+      // refuses the removal.
+      const exempt = new Set(carriedPaths ?? []);
       const isClean = async () => {
-        const status = await worktreeGit.status();
+        // -z keeps raw bytes: line-based output C-quotes non-ASCII,
+        // quotes, and newlines (core.quotepath), and the quoted form
+        // would never match the raw carried paths in the exemption set.
+        const status = await worktreeGit.raw([
+          'status',
+          '--porcelain',
+          '--untracked-files=all',
+          '-z',
+        ]);
+        for (const entry of status.split('\0')) {
+          if (entry.length === 0) continue;
+          // The carry applies the stash without --index, so the overlay
+          // never contains rename/copy records; one means the index was
+          // touched inside this never-attached worktree. Refuse.
+          if (entry[0] === 'R' || entry[0] === 'C') return false;
+          if (!exempt.has(entry.slice(3))) return false;
+        }
         const hiddenIndexEntries = await worktreeGit.raw([
           'ls-files',
           '-v',
@@ -3171,34 +4267,33 @@ export class GitWorktreeService {
         const hasHiddenIndexBits = hiddenIndexEntries
           .split('\0')
           .some((entry) => /^(?:S|[a-z])/.test(entry));
-        return (
-          status.isClean() &&
-          !hasHiddenIndexBits &&
-          !(await hasPopulatedGitlink()) &&
-          (
-            await worktreeGit.raw([
-              'clean',
-              '-ndx',
-              '-e',
-              `/${WORKTREE_SESSION_FILE}`,
-              '-e',
-              `/${WORKTREE_SESSION_FILE}.*.tmp`,
-            ])
-          ).trim().length === 0
-        );
+        if (hasHiddenIndexBits) return false;
+        if (await hasPopulatedGitlink()) return false;
+        // clean -ndx has no -z form and collapses untracked directories
+        // to "dir/", which never matches the file-level carried paths.
+        // ls-files --others lists raw file-level paths, ignored ones
+        // included — a late-arriving ignored file must still refuse.
+        const others = await worktreeGit.raw(['ls-files', '--others', '-z']);
+        return others
+          .split('\0')
+          .every(
+            (p) =>
+              p.length === 0 ||
+              exempt.has(p) ||
+              p === WORKTREE_SESSION_FILE ||
+              WORKTREE_SESSION_TMP_PATTERN.test(p),
+          );
       };
       if (!(await isClean())) {
         return { success: false, error: 'Worktree contains changes' };
       }
-      let branchTip = await this.getPreparedUserWorktreeBranchTip(slug);
-      if (branchTip !== expectedBaseCommit) {
+      if (!(await atBase())) {
         return { success: false, error: 'Worktree branch changed' };
       }
       if (!(await isClean())) {
         return { success: false, error: 'Worktree contains changes' };
       }
-      branchTip = await this.getPreparedUserWorktreeBranchTip(slug);
-      if (branchTip !== expectedBaseCommit) {
+      if (!(await atBase())) {
         return { success: false, error: 'Worktree branch changed' };
       }
       const finalPath = await fs.realpath(expectedPath);
@@ -3218,11 +4313,16 @@ export class GitWorktreeService {
         return { success: false, error: 'Worktree checkout changed' };
       }
       const git = await this.getGit();
-      await git.raw(['worktree', 'remove', worktreePath]);
+      // The gates above proved ownership and that HEAD never left the
+      // base; the dirty content is the carried overlay, a copy of state
+      // the source checkout still holds. git itself would refuse a dirty
+      // tree without --force, stranding the worktree and its journal.
+      await git.raw(['worktree', 'remove', worktreePath, '--force']);
       await onWorktreeRemoved?.();
       return await this.finalizePreparedUserWorktreeBranch(
         slug,
         expectedBaseCommit,
+        branchOwned,
       );
     } catch (error) {
       return {
@@ -3262,12 +4362,17 @@ export class GitWorktreeService {
   async finalizePreparedUserWorktreeBranch(
     slug: string,
     expectedBaseCommit: string,
+    branchOwned = true,
   ): Promise<{
     success: boolean;
     error?: string;
     branchPreserved?: boolean;
   }> {
     try {
+      // A detached preparation never created the slug-derived branch: a
+      // pre-existing ref of that name belongs to the user, even when its
+      // tip happens to sit at the base commit.
+      if (!branchOwned) return { success: true };
       const branchTip = await this.getPreparedUserWorktreeBranchTip(slug);
       if (branchTip === null) return { success: true };
       if (branchTip !== expectedBaseCommit) {
@@ -3288,6 +4393,44 @@ export class GitWorktreeService {
   }
 
   /**
+   * Whether the checkout at `worktreePath` is in detached HEAD. A missing
+   * or unreadable checkout reads as not detached: the removal path then
+   * fails or proceeds on its own filesystem merits.
+   */
+  private async isDetachedWorktree(worktreePath: string): Promise<boolean> {
+    try {
+      const { simpleGit } = await loadSimpleGit();
+      const abbrev = (
+        await simpleGit(worktreePath)
+          .env(gitEnv())
+          .revparse(['--abbrev-ref', 'HEAD'])
+      ).trim();
+      return abbrev === 'HEAD';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The branch the checkout sits on ('' when detached or unreadable).
+   * An unreadable checkout answers '' so ownership-keyed deletes stay
+   * conservative: no branch is deleted on its behalf.
+   */
+  private async getWorktreeBranchName(worktreePath: string): Promise<string> {
+    try {
+      const { simpleGit } = await loadSimpleGit();
+      const abbrev = (
+        await simpleGit(worktreePath)
+          .env(gitEnv())
+          .revparse(['--abbrev-ref', 'HEAD'])
+      ).trim();
+      return abbrev === 'HEAD' ? '' : abbrev;
+    } catch {
+      return '';
+    }
+  }
+
+  /**
    * Reports whether the tip of a user worktree's branch is reachable
    * only from itself — i.e. the branch carries commits that no other
    * local branch or remote ref points at, so dropping the branch would
@@ -3295,18 +4438,66 @@ export class GitWorktreeService {
    * removing the worktree would lose work the subagent committed but
    * never merged or pushed.
    *
+   * With the creation `baseCommit` in hand, a detached HEAD still at (or
+   * behind) that base carries no agent commits — even when the base
+   * itself is unreachable from any branch (a tag checkout, or a branch
+   * since moved/deleted), which the reachability test alone would
+   * misread as unmerged work.
+   *
    * Fail-closed: returns `true` on any git error so the caller defaults
    * to preserving rather than destroying the worktree.
    */
-  async hasUnmergedWorktreeCommits(slug: string): Promise<boolean> {
+  async hasUnmergedWorktreeCommits(
+    slug: string,
+    baseCommit?: string,
+  ): Promise<boolean> {
     const branchName = worktreeBranchForSlug(slug);
     try {
       const git = await this.getGit();
-      const tipSha = (await git.revparse([branchName])).trim();
+      // Judge whether REMOVAL would lose commits. Removal deletes the
+      // checkout directory and (when owned) the slug-derived ref
+      // worktree-<slug> — never a user branch the checkout was switched to
+      // ("Create branch here", `git switch -c`). So the ref to exclude from
+      // the reachability test is the slug ref, not the checkout's current
+      // branch: a checkout sitting on feat/x keeps feat/x after removal,
+      // and feat/x covering the tip means nothing is lost. When the
+      // checkout is unreadable (already removed, etc.), fall back to the
+      // slug ref below.
+      let ownRef: string | null = null;
+      let tipSha = '';
+      try {
+        const { simpleGit } = await loadSimpleGit();
+        const wtGit = simpleGit(this.getUserWorktreePath(slug)).env(gitEnv());
+        const abbrev = (await wtGit.revparse(['--abbrev-ref', 'HEAD'])).trim();
+        tipSha = (await wtGit.revparse(['HEAD'])).trim();
+        // The creation-base shortcut applies to EVERY shape: a checkout
+        // still at (or behind) its creation base added no commits, even
+        // when the base is unreachable from any branch (a tag checkout, or
+        // a branch since moved/deleted).
+        if (baseCommit && tipSha) {
+          if (tipSha === baseCommit) return false;
+          const count = (
+            await wtGit
+              .raw(['rev-list', '--count', `${baseCommit}..HEAD`])
+              .catch(() => '')
+          ).trim();
+          if (count === '0') return false;
+        }
+        if (abbrev !== 'HEAD') {
+          ownRef = `refs/heads/${branchName}`;
+        }
+      } catch {
+        // Fall through to the branch-ref probe.
+      }
+      if (!tipSha) {
+        tipSha = (await git.revparse([branchName])).trim();
+        ownRef = `refs/heads/${branchName}`;
+      }
       if (!tipSha) return true;
       // List every local branch and remote-tracking ref whose tip is at
-      // or above the worktree branch's tip. If anything other than the
-      // worktree branch itself appears, the commits are covered.
+      // or above the worktree's tip. If anything other than the slug ref
+      // removal may delete appears, the commits are covered. A detached
+      // HEAD has no own ref to exclude.
       const refs = (
         await git.raw([
           'for-each-ref',
@@ -3319,7 +4510,7 @@ export class GitWorktreeService {
       )
         .split('\n')
         .map((s) => s.trim())
-        .filter((s) => s.length > 0 && s !== `refs/heads/${branchName}`);
+        .filter((s) => s.length > 0 && s !== ownRef);
       return refs.length === 0;
     } catch (error) {
       // Fail-closed but log so a corrupted ref store or permission

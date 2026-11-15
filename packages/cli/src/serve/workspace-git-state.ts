@@ -20,6 +20,8 @@ export interface WorkspaceGitStatus {
   branch: string | null;
   /** v2 enriched fields — absent when not a repo or git is unavailable. */
   detached?: boolean;
+  /** false for an unborn HEAD (no commits yet): no worktree base exists. */
+  hasHead?: boolean;
   staged?: number;
   unstaged?: number;
   untracked?: number;
@@ -65,6 +67,7 @@ function sameWorkingTreeStatus(
   const _exhaustive: Record<keyof GitWorkingTreeStatus, true> = {
     branch: true,
     detached: true,
+    hasHead: true,
     hasUpstream: true,
     ahead: true,
     behind: true,
@@ -79,9 +82,13 @@ function sameWorkingTreeStatus(
   // branch is compared even though materialize() overlays the watcher branch:
   // a status.branch delta is the first signal of a checkout the watcher has
   // not yet seen — publishing is intentionally conservative.
+  // hasHead compares with ?? true: the field is optional on the wire and a
+  // one-sided absence must not read as a change (the first-commit transition
+  // false → true is exactly the delta the worktree default waits for).
   return (
     a.branch === b.branch &&
     a.detached === b.detached &&
+    (a.hasHead ?? true) === (b.hasHead ?? true) &&
     a.hasUpstream === b.hasUpstream &&
     a.ahead === b.ahead &&
     a.behind === b.behind &&
@@ -160,6 +167,7 @@ export class WorkspaceGitState {
       workspaceCwd,
       branch: entry.branch ?? status.branch ?? null,
       detached: status.detached,
+      hasHead: status.hasHead,
       staged: status.staged,
       unstaged: status.unstaged,
       untracked: status.untracked,
