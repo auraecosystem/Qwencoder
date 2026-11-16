@@ -1,0 +1,7 @@
+"model": {
+    "generationConfig": {
+      "samplingParams": {
+        "temperature": 0
+      }
+    }
+  }
